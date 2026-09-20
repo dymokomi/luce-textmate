@@ -139,6 +139,7 @@ pub struct Grammar:
     var file_types: Vec[Str]
     var repo: Vec[RepoEntry]
     var scope_name: Str = Str()
+    var display_name: Str = Str()
     var top_patterns: i32
 
     ## Load and compile a grammar from its `.tmLanguage.json` text. From Luce, construct a grammar
@@ -151,6 +152,7 @@ pub struct Grammar:
         self.file_types = Vec[Str]()
         self.repo = Vec[RepoEntry]()
         self.scope_name = Str()
+        self.display_name = Str()
         self.top_patterns = -1
         self.parse(source) catch failure:
             self.dispose()
@@ -181,6 +183,9 @@ pub struct Grammar:
         if let name = root.member("scopeName"):
             if let value = name.text():
                 self.scope_name = try self.intern(value)
+        if let display = root.member("name"):
+            if let value = display.text():
+                self.display_name = try self.intern(value)
         if let types = root.member("fileTypes"):
             var i: usize = 0
             while i < types.length():
@@ -329,6 +334,10 @@ pub struct Grammar:
     ## The grammar's scope name (e.g. "source.python").
     pub func scope() -> str:
         return self.text(self.scope_name)
+
+    ## The grammar's human-readable name (its `"name"` field, e.g. "C++"), or "".
+    pub func name() -> str:
+        return self.text(self.display_name)
 
     ## The number of file extensions the grammar declares.
     pub func file_type_count() -> i64:
