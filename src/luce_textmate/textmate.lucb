@@ -71,6 +71,15 @@ struct Vec[T]:
         self.used += 1
         return self.used - 1
 
+    mutating func copy_from(src: Vec[T]) -> !:
+        self.used = 0
+        try self.ensure(src.used)
+        var i: usize = 0
+        while i < src.used:
+            self.data[i] = src.data[i]
+            i += 1
+        self.used = src.used
+
     mutating func free_all():
         if self.data.length > 0:
             free(self.data) in memory.heap
@@ -380,7 +389,9 @@ struct OutSpan:
     var scope: Str = Str()
 
 ## One open region on the tokenizer's stack. Expanded patterns live as a slice [pat_start,
-## pat_start+pat_count) of the shared, stack-ordered `frame_pats` pool.
+## pat_start+pat_count) of the shared, stack-ordered `frame_pats` pool. `rule` and the override
+## `(ov_off, ov_len)` slice into `override_arena` capture just enough to snapshot and rebuild the
+## region for incremental re-tokenization.
 struct Frame:
     var scope: Str = Str()
     var content_scope: Str = Str()
@@ -392,6 +403,21 @@ struct Frame:
     var end_src: Str = Str()
     var pat_start: i32 = 0
     var pat_count: i32 = 0
+    var rule: i32 = -1
+    var ov_off: i32 = 0
+    var ov_len: i32 = 0
+
+## A snapshot of one open region for a saved line state: the rule that opened it and, for a
+## backreference `end`, the substituted source `(off, len)` in `override_arena`.
+struct FrameDescriptor:
+    var rule: i32 = 0
+    var off: i32 = 0
+    var len: i32 = 0
+
+## A saved line-end state: the region descriptors [start, start+count) in a descriptor pool.
+struct StateRef:
+    var start: i32 = 0
+    var count: i32 = 0
 
 ## Tokenizes a whole document for one grammar and holds the resulting spans for the caller to
 ## read. Re-tokenizing replaces the spans. All per-line work is plain Base memory.
@@ -414,6 +440,27 @@ pub struct Tokenizer:
     var c_end_start: i32
     # Scratch for building backreference end patterns.
     var build: Vec[u8]
+    # Line index: new_line_start[i] is line i's first codepoint; length line_count+1 (sentinel = end).
+    var new_line_start: Vec[i32]
+    var line_count: i32
+    # Current result's per-line index: line_span_start[i] is the first span of line i (length
+    # line_count+1), and state_ref[i] the region descriptors of line i's end state, into `desc`.
+    var line_span_start: Vec[i32]
+    var desc: Vec[FrameDescriptor]
+    var state_ref: Vec[StateRef]
+    # The substituted sources of every backreference `end` ever compiled (referenced by descriptors);
+    # reset only on a full tokenize.
+    var override_arena: Vec[u8]
+    # Convergence: the line at which an incremental pass met the old state (-1 = none this pass).
+    var converged_line: i32
+    # The previous result, kept for incremental reuse.
+    var has_prev: bool
+    var prev_spans: Vec[OutSpan]
+    var prev_line_span_start: Vec[i32]
+    var prev_desc: Vec[FrameDescriptor]
+    var prev_state_ref: Vec[StateRef]
+    var prev_line_count: i32
+    var prev_char_count: i32
 
     ## Create a tokenizer for `grammar`, which it keeps alive for its lifetime. From Luce,
     ## construct one with `Tokenizer(grammar)`.
@@ -431,14 +478,165 @@ pub struct Tokenizer:
         self.c_start = Vec[i32]()
         self.c_end_start = -1
         self.build = Vec[u8]()
+        self.new_line_start = Vec[i32]()
+        self.line_count = 0
+        self.line_span_start = Vec[i32]()
+        self.desc = Vec[FrameDescriptor]()
+        self.state_ref = Vec[StateRef]()
+        self.override_arena = Vec[u8]()
+        self.converged_line = -1
+        self.has_prev = false
+        self.prev_spans = Vec[OutSpan]()
+        self.prev_line_span_start = Vec[i32]()
+        self.prev_desc = Vec[FrameDescriptor]()
+        self.prev_state_ref = Vec[StateRef]()
+        self.prev_line_count = 0
+        self.prev_char_count = 0
 
     ## Tokenize the whole document `text`. Returns the number of spans, readable with the span
     ## accessors. Colours from the top of the file down; a very large file's tail may be left
     ## plain when the time budget is spent.
     pub mutating func tokenize(text: str) -> i64!:
-        self.spans.used = 0
         self.all.used = 0
         try self.decode_text(text)
+        try self.build_line_starts()
+        return try self.full_tokenize()
+
+    ## Re-tokenize after a single edit that replaced old `[start, old_end)` with new
+    ## `[start, new_end)` (codepoint offsets). Reuses the unchanged prefix and — via end-state
+    ## convergence — the unchanged suffix, so a typical edit re-runs the grammar on only a few lines.
+    ## Falls back to a full tokenize when there is no previous result or the metadata does not line up.
+    pub mutating func tokenize_edit(text: str, start: i64, old_end: i64, new_end: i64) -> i64!:
+        if not self.has_prev:
+            return try self.tokenize(text)
+        self.all.used = 0
+        try self.decode_text(text)
+        try self.build_line_starts()
+        let new_char_count = (i32)self.all.used
+        let delta_chars = (i32)new_end - (i32)old_end
+        let delta_lines = self.line_count - self.prev_line_count
+        if new_char_count != self.prev_char_count + delta_chars or start < 0 or new_end < start or old_end < start or (i32)new_end > new_char_count:
+            return try self.full_tokenize()
+        let first_line = self.line_index_of((i32)start)
+        let last_line = self.line_index_of((i32)new_end)
+        if first_line > self.prev_line_count or last_line >= self.line_count:
+            return try self.full_tokenize()
+        self.spans.used = 0
+        self.line_span_start.used = 0
+        self.desc.used = 0
+        self.state_ref.used = 0
+        # 1. Copy the unchanged prefix (lines before the edit) verbatim.
+        let prefix_spans = self.prev_line_span_start.data[(usize)first_line]
+        var p: usize = 0
+        while p < (usize)prefix_spans:
+            discard(try self.spans.push(self.prev_spans.data[p]))
+            p += 1
+        var li: i32 = 0
+        while li < first_line:
+            discard(try self.line_span_start.push(self.prev_line_span_start.data[(usize)li]))
+            discard(try self.state_ref.push(try self.copy_state(self.prev_state_ref.data[(usize)li])))
+            li += 1
+        # 2. Rebuild the live stack entering the first changed line.
+        if first_line == 0:
+            try self.push_root()
+        else:
+            try self.rebuild_stack(self.prev_state_ref.data[(usize)(first_line - 1)])
+        # 3. Tokenize from the first changed line until state convergence or EOF.
+        let stopped = try self.run_from(first_line, true, delta_lines, last_line)
+        if self.converged_line >= 0:
+            try self.reuse_suffix(self.converged_line, delta_lines, delta_chars)
+            discard(try self.line_span_start.push((i32)self.spans.used))
+            try self.save_prev()
+            self.has_prev = true
+        elif stopped >= self.line_count:
+            discard(try self.line_span_start.push((i32)self.spans.used))
+            try self.save_prev()
+            self.has_prev = true
+        else:
+            try self.fill_empty_lines(stopped)
+            discard(try self.line_span_start.push((i32)self.spans.used))
+            try self.save_prev()
+            self.has_prev = false
+        self.clear_stack()
+        return (i64)self.spans.used
+
+    ## A full tokenize over the already-decoded document. Colours top to bottom; a very large file's
+    ## tail may be left plain when the time budget is spent (then no incremental reuse is offered).
+    mutating func full_tokenize() -> i64!:
+        self.override_arena.used = 0
+        self.spans.used = 0
+        self.line_span_start.used = 0
+        self.desc.used = 0
+        self.state_ref.used = 0
+        try self.push_root()
+        let stopped = try self.run_from(0, false, 0, 0)
+        if stopped < self.line_count:
+            try self.fill_empty_lines(stopped)
+        discard(try self.line_span_start.push((i32)self.spans.used))
+        try self.save_prev()
+        self.has_prev = stopped >= self.line_count
+        self.clear_stack()
+        return (i64)self.spans.used
+
+    ## Tokenize lines from `from_line` down, appending each line's spans and end state. When
+    ## `converge`, once a line at or past `last_line` reaches the same end state the previous result
+    ## had at the aligned old line, stop (that convergence line is recorded in `converged_line`) —
+    ## the rest of the suffix is unchanged. Returns the first line not processed (== line_count at EOF).
+    mutating func run_from(from_line: i32, converge: bool, delta_lines: i32, last_line: i32) -> i32!:
+        self.converged_line = -1
+        let started = time_now()
+        var n = from_line
+        while n < self.line_count:
+            discard(try self.line_span_start.push((i32)self.spans.used))
+            let ls = (usize)self.new_line_start.data[(usize)n]
+            var le: usize = self.all.used
+            if n + 1 < self.line_count:
+                le = (usize)(self.new_line_start.data[(usize)(n + 1)] - 1)
+            if (i32)(le - ls) <= MAX_LINE:
+                try self.tokenize_line(ls, le)
+            let state = try self.capture_state()
+            discard(try self.state_ref.push(state))
+            if converge and n >= last_line:
+                let old_index = n - delta_lines
+                if old_index >= 0 and old_index < self.prev_line_count and self.states_equal(state, self.prev_state_ref.data[(usize)old_index]):
+                    self.converged_line = n
+                    return n + 1
+            n += 1
+            if time_since(started) > BUDGET_NS:
+                return n
+        return n
+
+    ## Split the decoded document into lines: record each line's start codepoint plus an end sentinel.
+    mutating func build_line_starts() -> !:
+        self.new_line_start.used = 0
+        let total = self.all.used
+        var ls: usize = 0
+        while true:
+            discard(try self.new_line_start.push((i32)ls))
+            var le = ls
+            while le < total and self.all.data[le] != (u32)'\n':
+                le += 1
+            if le >= total:
+                break
+            ls = le + 1
+        discard(try self.new_line_start.push((i32)total))
+        self.line_count = (i32)self.new_line_start.used - 1
+
+    ## The line containing codepoint `offset` (the largest line whose start is <= offset).
+    func line_index_of(offset: i32) -> i32:
+        var lo: i32 = 0
+        var hi: i32 = self.line_count - 1
+        var answer: i32 = 0
+        while lo <= hi:
+            let mid = (lo + hi) // 2
+            if self.new_line_start.data[(usize)mid] <= offset:
+                answer = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return answer
+
+    mutating func push_root() -> !:
         self.clear_stack()
         var root = Frame()
         self.frame_pats.used = 0
@@ -447,22 +645,109 @@ pub struct Tokenizer:
         root.pat_count = (i32)self.frame_pats.used
         discard(try self.stack.push(root))
         self.frame_gen = 0
-        let started = time_now()
-        let total = self.all.used
-        var line_start: usize = 0
-        while true:
-            var line_end = line_start
-            while line_end < total and self.all.data[line_end] != (u32)'\n':
-                line_end += 1
-            if (i32)(line_end - line_start) <= MAX_LINE:
-                try self.tokenize_line(line_start, line_end)
-            if line_end >= total:
-                break
-            line_start = line_end + 1
-            if time_since(started) > BUDGET_NS:
-                break
-        self.clear_stack()
-        return (i64)self.spans.used
+
+    ## Snapshot the current live region stack (everything above the root) as a saved state.
+    mutating func capture_state() -> StateRef!:
+        let start = (i32)self.desc.used
+        var i: usize = 1
+        while i < self.stack.used:
+            let frame = self.stack.data[i]
+            discard(try self.desc.push(FrameDescriptor(rule = frame.rule, off = frame.ov_off, len = frame.ov_len)))
+            i += 1
+        return StateRef(start = start, count = (i32)self.desc.used - start)
+
+    ## Rebuild the live stack from a saved state in the previous result's descriptor pool.
+    mutating func rebuild_stack(saved: StateRef) -> !:
+        try self.push_root()
+        var i: i32 = 0
+        while i < saved.count:
+            try self.reconstruct_region(self.prev_desc.data[(usize)(saved.start + i)])
+            i += 1
+
+    mutating func reconstruct_region(descriptor: FrameDescriptor) -> !:
+        let rule = self.grammar.rules.data[(usize)descriptor.rule]
+        var frame = Frame()
+        frame.rule = descriptor.rule
+        frame.scope = rule.scope
+        frame.content_scope = rule.content_scope
+        frame.end_captures_head = rule.end_captures_head
+        frame.apply_end_last = rule.apply_end_last
+        frame.end_src = rule.end_src
+        frame.pat_start = (i32)self.frame_pats.used
+        try self.expand_into(rule.patterns_head)
+        frame.pat_count = (i32)self.frame_pats.used - frame.pat_start
+        if descriptor.len > 0:
+            let source = (str)self.override_arena.data[(usize)descriptor.off..<(usize)(descriptor.off + descriptor.len)]
+            frame.end = new regex.Regex(source, false) catch failure:
+                recover none
+            frame.owns_end = true
+            frame.ov_off = descriptor.off
+            frame.ov_len = descriptor.len
+        elif rule.is_while:
+            frame.while_rgx = rule.while_rgx
+        else:
+            frame.end = rule.end
+        discard(try self.stack.push(frame))
+        self.frame_gen += 1
+
+    func states_equal(current: StateRef, previous: StateRef) -> bool:
+        if current.count != previous.count:
+            return false
+        var i: i32 = 0
+        while i < current.count:
+            let a = self.desc.data[(usize)(current.start + i)]
+            let b = self.prev_desc.data[(usize)(previous.start + i)]
+            if a.rule != b.rule or a.len != b.len:
+                return false
+            var k: i32 = 0
+            while k < a.len:
+                if self.override_arena.data[(usize)(a.off + k)] != self.override_arena.data[(usize)(b.off + k)]:
+                    return false
+                k += 1
+            i += 1
+        return true
+
+    ## Reuse the unchanged suffix (lines after `converged`) from the previous result, shifting its
+    ## span offsets by the edit's codepoint delta and remapping its line indices.
+    mutating func reuse_suffix(converged: i32, delta_lines: i32, delta_chars: i32) -> !:
+        let old_first = (converged + 1) - delta_lines
+        let source_first = self.prev_line_span_start.data[(usize)old_first]
+        let suffix_base = (i32)self.spans.used
+        var k: usize = (usize)source_first
+        while k < self.prev_spans.used:
+            let span = self.prev_spans.data[k]
+            discard(try self.spans.push(OutSpan(start = span.start + delta_chars, end = span.end + delta_chars, scope = span.scope)))
+            k += 1
+        var m = converged + 1
+        while m < self.line_count:
+            let old_m = m - delta_lines
+            let relative = self.prev_line_span_start.data[(usize)old_m] - source_first
+            discard(try self.line_span_start.push(suffix_base + relative))
+            discard(try self.state_ref.push(try self.copy_state(self.prev_state_ref.data[(usize)old_m])))
+            m += 1
+
+    mutating func copy_state(previous: StateRef) -> StateRef!:
+        let start = (i32)self.desc.used
+        var i: i32 = 0
+        while i < previous.count:
+            discard(try self.desc.push(self.prev_desc.data[(usize)(previous.start + i)]))
+            i += 1
+        return StateRef(start = start, count = previous.count)
+
+    mutating func fill_empty_lines(start_line: i32) -> !:
+        var n = start_line
+        while n < self.line_count:
+            discard(try self.line_span_start.push((i32)self.spans.used))
+            discard(try self.state_ref.push(StateRef(start = (i32)self.desc.used, count = 0)))
+            n += 1
+
+    mutating func save_prev() -> !:
+        try self.prev_spans.copy_from(self.spans)
+        try self.prev_line_span_start.copy_from(self.line_span_start)
+        try self.prev_desc.copy_from(self.desc)
+        try self.prev_state_ref.copy_from(self.state_ref)
+        self.prev_line_count = self.line_count
+        self.prev_char_count = (i32)self.all.used
 
     mutating func decode_text(text: str) -> !:
         let bytes = text.bytes
@@ -615,11 +900,13 @@ pub struct Tokenizer:
         let base_scope = rule.scope if rule.scope.len > 0 else self.deepest()
         self.fill(best_start, best_end, base_scope)
         self.apply_captures(r, rule.begin_captures_head)
-        try self.push_region(rule, r, subject)
+        try self.push_region(rule_index, r, subject)
         return best_end
 
-    mutating func push_region(rule: Rule, m: regex.Regex*, subject: const u32[]) -> !:
+    mutating func push_region(rule_index: i32, m: regex.Regex*, subject: const u32[]) -> !:
+        let rule = self.grammar.rules.data[(usize)rule_index]
         var frame = Frame()
+        frame.rule = rule_index
         frame.scope = rule.scope
         frame.content_scope = rule.content_scope
         frame.end_captures_head = rule.end_captures_head
@@ -633,6 +920,14 @@ pub struct Tokenizer:
         elif rule.end_has_backref:
             frame.end = self.build_end(self.grammar.text(rule.end_src), m, subject)
             frame.owns_end = true
+            # Intern the substituted source (left in `build` by build_end) so a saved state can
+            # reconstruct this exact end regex later.
+            frame.ov_off = (i32)self.override_arena.used
+            var b: usize = 0
+            while b < self.build.used:
+                discard(try self.override_arena.push(self.build.data[b]))
+                b += 1
+            frame.ov_len = (i32)self.build.used
         else:
             frame.end = rule.end
         discard(try self.stack.push(frame))
@@ -855,6 +1150,15 @@ pub struct Tokenizer:
         self.owner.free_all()
         self.c_start.free_all()
         self.build.free_all()
+        self.new_line_start.free_all()
+        self.line_span_start.free_all()
+        self.desc.free_all()
+        self.state_ref.free_all()
+        self.override_arena.free_all()
+        self.prev_spans.free_all()
+        self.prev_line_span_start.free_all()
+        self.prev_desc.free_all()
+        self.prev_state_ref.free_all()
         self.grammar_ref.release()
 
     ## Visit the strong references this tokenizer holds (its grammar), for the collector.
@@ -963,3 +1267,113 @@ test "tokenizer nests regions and $self includes":
 test "tokenizer carries region state across lines within a document":
     # The open string on line 1 stays open and closes on line 2; codepoint offsets are absolute.
     assert(try check("{\"scopeName\":\"source.toy\",\"patterns\":[{\"begin\":\"\\\"\",\"end\":\"\\\"\",\"name\":\"string.quoted.double.toy\"}]}", "x \"open\nstill\" y", "2-7:string.quoted.double.toy;8-14:string.quoted.double.toy;"))
+
+# -- incremental re-tokenization ---------------------------------------------------------------
+
+func toy() -> str:
+    return "{\"scopeName\":\"source.toy\",\"patterns\":[{\"match\":\"\\\\b(let|if|else)\\\\b\",\"name\":\"kw\"},{\"begin\":\"\\\"\",\"end\":\"\\\"\",\"name\":\"str\"},{\"match\":\"#.*$\",\"name\":\"cmt\"},{\"match\":\"[0-9]+\",\"name\":\"num\"}]}"
+
+func render_spans(native: Tokenizer*, out: Vec[u8]*) -> !:
+    out.used = 0
+    let count = native.span_count()
+    var i: i64 = 0
+    while i < count:
+        var buffer: u8[24]
+        try append_str(out, try format(buffer, f"{native.span_start(i)}-{native.span_end(i)}:"))
+        try append_str(out, native.span_scope(i))
+        try append_str(out, ";")
+        i += 1
+
+## Apply an edit (replace old `[start, old_end)` with `replacement`) to `base` into `out`.
+func apply_edit(base: str, start: i64, old_end: i64, replacement: str, out: Vec[u8]*) -> !:
+    out.used = 0
+    let bytes = base.bytes
+    var i: usize = 0
+    while i < (usize)start:
+        discard(try out.push(bytes[i]))
+        i += 1
+    try append_str(out, replacement)
+    i = (usize)old_end
+    while i < bytes.length:
+        discard(try out.push(bytes[i]))
+        i += 1
+
+## An incremental re-tokenize after one edit must match a fresh full tokenize of the same result.
+func edits_match(source: str, initial: str, start: i64, old_end: i64, replacement: str) -> bool!:
+    var ok = false
+    with memory.heap:
+        let grammar = try load(source)
+        defer grammar.release()
+        var buffer = Vec[u8]()
+        defer buffer.free_all()
+        try apply_edit(initial, start, old_end, replacement, &buffer)
+        let new_text = (str)buffer.data[..<buffer.used]
+        let new_end = start + (i64)replacement.bytes.length
+        let tok = try tokenizer(grammar)
+        defer tok.release()
+        let native = try tok.get()
+        discard(try native.tokenize(initial))
+        discard(try native.tokenize_edit(new_text, start, old_end, new_end))
+        var incremental = Vec[u8]()
+        defer incremental.free_all()
+        try render_spans(native, &incremental)
+        let fresh = try tokenizer(grammar)
+        defer fresh.release()
+        let fresh_native = try fresh.get()
+        discard(try fresh_native.tokenize(new_text))
+        var full = Vec[u8]()
+        defer full.free_all()
+        try render_spans(fresh_native, &full)
+        ok = (str)incremental.data[..<incremental.used] == (str)full.data[..<full.used]
+    return ok
+
+## Two chained incremental edits must match a fresh full tokenize of the final text.
+func two_edits_match(source: str, initial: str, s1: i64, e1: i64, r1: str, s2: i64, e2: i64, r2: str) -> bool!:
+    var ok = false
+    with memory.heap:
+        let grammar = try load(source)
+        defer grammar.release()
+        var mid = Vec[u8]()
+        defer mid.free_all()
+        try apply_edit(initial, s1, e1, r1, &mid)
+        let text1 = (str)mid.data[..<mid.used]
+        let end1 = s1 + (i64)r1.bytes.length
+        var last = Vec[u8]()
+        defer last.free_all()
+        try apply_edit(text1, s2, e2, r2, &last)
+        let text2 = (str)last.data[..<last.used]
+        let end2 = s2 + (i64)r2.bytes.length
+        let tok = try tokenizer(grammar)
+        defer tok.release()
+        let native = try tok.get()
+        discard(try native.tokenize(initial))
+        discard(try native.tokenize_edit(text1, s1, e1, end1))
+        discard(try native.tokenize_edit(text2, s2, e2, end2))
+        var incremental = Vec[u8]()
+        defer incremental.free_all()
+        try render_spans(native, &incremental)
+        let fresh = try tokenizer(grammar)
+        defer fresh.release()
+        let fresh_native = try fresh.get()
+        discard(try fresh_native.tokenize(text2))
+        var full = Vec[u8]()
+        defer full.free_all()
+        try render_spans(fresh_native, &full)
+        ok = (str)incremental.data[..<incremental.used] == (str)full.data[..<full.used]
+    return ok
+
+test "incremental edit matches a full re-tokenize across edit shapes":
+    let initial = "let x = \"abc\"\nlet y = 5\n# c\nlet z = 9"
+    assert(try edits_match(toy(), initial, 2, 2, "Q"))          # insert on line 0
+    assert(try edits_match(toy(), initial, 16, 16, "abc"))      # insert on a middle line
+    assert(try edits_match(toy(), initial, 24, 25, ""))         # delete the '#' (line stops being a comment)
+    assert(try edits_match(toy(), initial, 16, 16, "\n"))       # insert a newline (line count +1)
+    assert(try edits_match(toy(), initial, 13, 23, ""))         # delete a whole line (line count -1)
+    assert(try edits_match(toy(), initial, 16, 16, "\""))       # open a string that runs to EOF
+    assert(try edits_match(toy(), initial, 36, 36, "0"))        # edit the last line
+    assert(try edits_match(toy(), initial, 0, 3, "if"))         # replace the first token
+
+test "chained incremental edits match a full re-tokenize":
+    let initial = "let a = 1\nlet b = 2\nlet c = 3\nlet d = 4"
+    assert(try two_edits_match(toy(), initial, 4, 4, "Z", 20, 20, "\"open"))
+    assert(try two_edits_match(toy(), initial, 10, 19, "", 0, 0, "if "))
