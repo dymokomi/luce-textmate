@@ -87,14 +87,17 @@ pub class PatternRef:
         self.rule = none
         self.include = ""
 
-## A whole grammar: its scope name, its top-level patterns, and its named repository rules.
+## A whole grammar: its scope name, the file extensions it claims, its top-level patterns, and
+## its named repository rules.
 pub class Grammar:
     pub var scope_name: str
+    pub var file_types: list[str]
     pub var patterns: list[PatternRef]
     pub var repository: map[str, Rule]
 
     func init(self):
         self.scope_name = ""
+        self.file_types = []
         self.patterns = []
         self.repository = {}
 
@@ -105,6 +108,13 @@ pub func load(source: str) -> Grammar!:
     let root = try parse(source)
     let grammar = Grammar()
     grammar.scope_name = root.text_of("scopeName")
+    if let types = root.get("fileTypes"):
+        var i = 0
+        while i < types.length():
+            if let t = types.at(i):
+                if t.is_string():
+                    grammar.file_types.append(t.as_str())
+            i += 1
     grammar.patterns = build_patterns(root.get("patterns"))
     if let repo = root.get("repository"):
         for name in repo.keys():
