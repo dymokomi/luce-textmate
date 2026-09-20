@@ -20,6 +20,7 @@
 import memory
 import utf8
 import interop
+import ownership
 import strings
 import time
 import regex
@@ -131,7 +132,9 @@ pub struct Grammar:
     var scope_name: Str = Str()
     var top_patterns: i32
 
-    pub func init() -> !:
+    ## Load and compile a grammar from its `.tmLanguage.json` text. From Luce, construct a grammar
+    ## with `Grammar(source)`; from luce-base, `load(source)` returns an owned reference.
+    pub func init(source: str) -> !:
         self.arena = Vec[u8]()
         self.rules = Vec[Rule]()
         self.patrefs = Vec[PatternRef]()
@@ -140,6 +143,9 @@ pub struct Grammar:
         self.repo = Vec[RepoEntry]()
         self.scope_name = Str()
         self.top_patterns = -1
+        self.parse(source) catch failure:
+            self.dispose()
+            error(failure.code, failure.message)
 
     # -- arena ---------------------------------------------------------------------------------
 
@@ -316,11 +322,11 @@ pub struct Grammar:
         return self.text(self.scope_name)
 
     ## The number of file extensions the grammar declares.
-    pub func file_type_count() -> i32:
-        return (i32)self.file_types.used
+    pub func file_type_count() -> i64:
+        return (i64)self.file_types.used
 
     ## The file extension at `index` (without a dot), or "".
-    pub func file_type(index: i32) -> str:
+    pub func file_type(index: i64) -> str:
         if index < 0 or (usize)index >= self.file_types.used:
             return ""
         return self.text(self.file_types.data[(usize)index])
@@ -360,13 +366,9 @@ pub struct Grammar:
 ## The interop type of a loaded `Grammar`.
 pub let grammar_type: interop.Type[Grammar] = interop.Type[Grammar]("TextMate grammar", Grammar.close, closeable = true)
 
-## Load a grammar from its `.tmLanguage.json` text.
+## Load a grammar from its `.tmLanguage.json` text (luce-base callers); Luce uses `Grammar(source)`.
 pub func load(source: str) -> interop.Reference[Grammar]!:
-    let native = try new Grammar()
-    native.parse(source) catch failure:
-        native.dispose()
-        free(native)
-        error(failure.code, failure.message)
+    let native = try new Grammar(source)
     return try Grammar.own(native)
 
 # mark: The tokenizer =========================================================================
@@ -413,7 +415,9 @@ pub struct Tokenizer:
     # Scratch for building backreference end patterns.
     var build: Vec[u8]
 
-    func init(grammar_ref: interop.Reference[Grammar]) -> !:
+    ## Create a tokenizer for `grammar`, which it keeps alive for its lifetime. From Luce,
+    ## construct one with `Tokenizer(grammar)`.
+    pub func init(grammar_ref: interop.Reference[Grammar]) -> !:
         self.grammar_ref = grammar_ref.clone()
         self.grammar = try grammar_ref.get()
         self.all = Vec[u32]()
@@ -431,7 +435,7 @@ pub struct Tokenizer:
     ## Tokenize the whole document `text`. Returns the number of spans, readable with the span
     ## accessors. Colours from the top of the file down; a very large file's tail may be left
     ## plain when the time budget is spent.
-    pub mutating func tokenize(text: str) -> i32!:
+    pub mutating func tokenize(text: str) -> i64!:
         self.spans.used = 0
         self.all.used = 0
         try self.decode_text(text)
@@ -458,7 +462,7 @@ pub struct Tokenizer:
             if time_since(started) > BUDGET_NS:
                 break
         self.clear_stack()
-        return (i32)self.spans.used
+        return (i64)self.spans.used
 
     mutating func decode_text(text: str) -> !:
         let bytes = text.bytes
@@ -815,23 +819,23 @@ pub struct Tokenizer:
     # -- span accessors (interop) --------------------------------------------------------------
 
     ## The number of spans from the last tokenize call.
-    pub func span_count() -> i32:
-        return (i32)self.spans.used
+    pub func span_count() -> i64:
+        return (i64)self.spans.used
 
     ## The start codepoint offset of span `index`.
-    pub func span_start(index: i32) -> i32:
+    pub func span_start(index: i64) -> i64:
         if index < 0 or (usize)index >= self.spans.used:
             return 0
-        return self.spans.data[(usize)index].start
+        return (i64)self.spans.data[(usize)index].start
 
     ## The end codepoint offset of span `index`.
-    pub func span_end(index: i32) -> i32:
+    pub func span_end(index: i64) -> i64:
         if index < 0 or (usize)index >= self.spans.used:
             return 0
-        return self.spans.data[(usize)index].end
+        return (i64)self.spans.data[(usize)index].end
 
     ## The scope name of span `index` (borrowed from the grammar; the caller copies it).
-    pub func span_scope(index: i32) -> str:
+    pub func span_scope(index: i64) -> str:
         if index < 0 or (usize)index >= self.spans.used:
             return ""
         return self.grammar.text(self.spans.data[(usize)index].scope)
@@ -853,11 +857,15 @@ pub struct Tokenizer:
         self.build.free_all()
         self.grammar_ref.release()
 
+    ## Visit the strong references this tokenizer holds (its grammar), for the collector.
+    func trace(visit: func(ownership.Object*, void*) -> unit, context: void*):
+        self.grammar_ref.trace(visit, context)
+
     static func own(native: Tokenizer*) -> interop.Reference[Tokenizer]!:
         return try interop.Reference[Tokenizer].adopt(native, tokenizer_type)
 
 ## The interop type of a `Tokenizer`.
-pub let tokenizer_type: interop.Type[Tokenizer] = interop.Type[Tokenizer]("TextMate tokenizer", Tokenizer.close, closeable = true)
+pub let tokenizer_type: interop.Type[Tokenizer] = interop.Type[Tokenizer]("TextMate tokenizer", Tokenizer.close, Tokenizer.trace, closeable = true)
 
 ## Create a tokenizer for `grammar`. It keeps the grammar alive for its lifetime.
 pub func tokenizer(grammar: interop.Reference[Grammar]) -> interop.Reference[Tokenizer]!:
