@@ -11,7 +11,7 @@ parser.add_argument("--base", type=Path, default=ROOT.parent / ("luce-base/build
 parser.add_argument("--luce", type=Path, default=ROOT.parent / ("luce/build/luce.exe" if os.name == "nt" else "luce/build/luce"))
 args = parser.parse_args()
 env = dict(os.environ, LUCE_BASE=str(args.base.resolve()))
-modules = ["json.luc"]
+modules = ["json.luc", "grammar.luc", "tokenizer.luc"]
 for name in modules:
     module = ROOT / "src/luce_textmate" / name
     for flags in [["--native"], ["--backend=c"]]:

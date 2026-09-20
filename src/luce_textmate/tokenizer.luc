@@ -1,0 +1,402 @@
+#==============================================================================================
+#
+#   tokenizer - a line-at-a-time TextMate tokenizer
+#
+#   DESCRIPTION:
+#       Runs a grammar over one line of scalars and returns scoped spans plus the rule state to
+#       carry into the next line, so an editor can highlight incrementally. It keeps a stack of
+#       open regions; on each step it takes the leftmost match among the active patterns and the
+#       current region's end, colouring text by the innermost scope in force. Includes ($self,
+#       $base, #name) are spliced in; an `end` that refers back to `begin` captures is recompiled
+#       per region. Depends only on the prelude, luce-regex and the package's grammar model.
+#
+#==============================================================================================
+
+from regex import Regex, Match, scalars
+from luce_textmate.grammar import Grammar, Rule, Capture, PatternRef, compile_safe, match_rule, begin_end_rule, ref_of, include_of
+
+# mark: Output and state ======================================================================
+
+## A coloured run of the line: scalars [start, end) carry `scope` (the innermost scope name).
+pub class Span:
+    pub let start: int
+    pub let end: int
+    pub let scope: str
+
+    func init(self, start: int, end: int, scope: str):
+        self.start = start
+        self.end = end
+        self.scope = scope
+
+## One open region on the tokenizer's stack: the scopes it contributes, its compiled end (or the
+## `while` that holds it open), the captures for that delimiter, and the patterns active inside.
+class Frame:
+    var scope: str
+    var content_scope: str
+    var end: Regex?
+    var while_rgx: Regex?
+    var end_captures: list[Capture]
+    var apply_end_last: bool
+    var end_src: str
+    var patterns: list[Rule]
+
+    func init(self):
+        self.scope = ""
+        self.content_scope = ""
+        self.end = none
+        self.while_rgx = none
+        self.end_captures = []
+        self.apply_end_last = false
+        self.end_src = ""
+        self.patterns = []
+
+## The rule state between lines. Two states with the same signature are interchangeable, which
+## lets a highlighter stop re-tokenizing once the carried state matches what it had before.
+pub class State:
+    pub var frames: list[Frame]
+
+    func init(self, frames: list[Frame]):
+        self.frames = frames
+
+    pub func signature(self) -> str:
+        var s = ""
+        for f in self.frames:
+            s += f.scope + "\u{1}" + f.content_scope + "\u{1}" + f.end_src + "\u{2}"
+        return s
+
+## The result of tokenizing a line.
+pub class Outcome:
+    pub let spans: list[Span]
+    pub let state: State
+
+    func init(self, spans: list[Span], state: State):
+        self.spans = spans
+        self.state = state
+
+# mark: The tokenizer =========================================================================
+
+pub class Tokenizer:
+    let grammar: Grammar
+
+    func init(self, grammar: Grammar):
+        self.grammar = grammar
+
+    ## The state to start a document in: a single root region carrying the grammar's patterns.
+    pub func start_state(self) -> State:
+        let root = Frame()
+        root.patterns = self.expand(self.grammar.patterns, [])
+        var frames: list[Frame] = []
+        frames.append(root)
+        return State(frames)
+
+    ## Tokenize one line (its scalars, without a trailing newline) starting from `incoming`.
+    pub func run(self, subject: list[str], incoming: State) -> Outcome:
+        let n = subject.length
+        var stack: list[Frame] = []
+        for f in incoming.frames:
+            stack.append(f)
+        var owner: list[str] = []
+        var z = 0
+        while z < n:
+            owner.append("")
+            z += 1
+        var pos = self.enter_line(stack, subject, owner)
+        var guard = 0
+        let limit = n * 6 + 64
+        while pos <= n:
+            guard += 1
+            if guard > limit:
+                break
+            let before = stack.length
+            let advanced = self.step(stack, subject, owner, pos, n)
+            if advanced < 0:
+                break
+            if advanced == pos and stack.length == before:
+                pos += 1
+            else:
+                pos = advanced
+        if pos < n:
+            self.fill(owner, pos, n, self.deepest(stack))
+        return Outcome(coalesce(owner, n), State(stack))
+
+    ## At line start, keep or drop `while` regions: each must still match, or it and everything
+    ## nested inside it close. Returns the position after any consumed `while` delimiters.
+    func enter_line(self, stack: list[Frame], subject: list[str], owner: list[str]) -> int:
+        var p = 0
+        var i = 0
+        while i < stack.length:
+            let f = stack[i]
+            if let w = f.while_rgx:
+                if let m = w.match_at(subject, p, p):
+                    self.fill(owner, p, m.finish(), self.deepest(stack))
+                    self.apply_captures(owner, m, f.end_captures)
+                    p = m.finish()
+                else:
+                    while stack.length > i:
+                        discard(stack.pop())
+                    return p
+            i += 1
+        return p
+
+    ## Take one step from `pos`: colour up to the leftmost match, then apply it (a match rule, a
+    ## region begin, or the current region's end). Returns the new position, or -1 when nothing
+    ## on the rest of the line matches.
+    func step(self, stack: list[Frame], subject: list[str], owner: list[str], pos: int, n: int) -> int:
+        let top = stack[stack.length - 1]
+        var best_start = n + 1
+        var best_end = 0
+        var best_match: Match? = none
+        var best_rule: Rule? = none
+        var best_is_end = false
+        if not top.apply_end_last:
+            if let e = top.end:
+                if let m = e.search(subject, pos, pos):
+                    if m.start() < best_start:
+                        best_start = m.start()
+                        best_end = m.finish()
+                        best_match = m
+                        best_is_end = true
+                        best_rule = none
+        for rule in top.patterns:
+            let re = rule.matcher if rule.is_match() else rule.begin
+            let r = re else continue
+            if let m = r.search(subject, pos, pos):
+                if m.start() < best_start:
+                    best_start = m.start()
+                    best_end = m.finish()
+                    best_match = m
+                    best_is_end = false
+                    best_rule = rule
+        if top.apply_end_last:
+            if let e = top.end:
+                if let m = e.search(subject, pos, pos):
+                    if m.start() < best_start:
+                        best_start = m.start()
+                        best_end = m.finish()
+                        best_match = m
+                        best_is_end = true
+                        best_rule = none
+        let m = best_match else return -1
+        self.fill(owner, pos, best_start, self.deepest(stack))
+        if best_is_end:
+            let base = self.deepest(stack)
+            self.fill(owner, best_start, best_end, base)
+            self.apply_captures(owner, m, top.end_captures)
+            discard(stack.pop())
+            return best_end
+        let rule = best_rule else return -1
+        if rule.is_match():
+            let base = rule.scope if rule.scope != "" else self.deepest(stack)
+            self.fill(owner, best_start, best_end, base)
+            self.apply_captures(owner, m, rule.captures)
+            return best_end
+        let base = rule.scope if rule.scope != "" else self.deepest(stack)
+        self.fill(owner, best_start, best_end, base)
+        self.apply_captures(owner, m, rule.begin_captures)
+        let frame = Frame()
+        frame.scope = rule.scope
+        frame.content_scope = rule.content_scope
+        frame.end_captures = rule.end_captures
+        frame.apply_end_last = rule.apply_end_last
+        frame.end_src = rule.end_src
+        frame.patterns = self.expand(rule.patterns, [])
+        if rule.is_while:
+            frame.while_rgx = rule.while_rgx
+        elif rule.end_has_backref:
+            frame.end = self.build_end(rule.end_src, m, subject)
+        else:
+            frame.end = rule.end
+        stack.append(frame)
+        return best_end
+
+    ## Splice includes into a flat list of concrete rules (those with a `match` or `begin`),
+    ## following $self/$base and #name, and inlining grouping rules. A visited set guards cycles.
+    func expand(self, refs: list[PatternRef], visited: list[str]) -> list[Rule]:
+        var out: list[Rule] = []
+        for ref in refs:
+            if ref.include != "":
+                self.expand_include(ref.include, visited, out)
+            elif let r = ref.rule:
+                if r.is_group():
+                    let sub = self.expand(r.patterns, visited)
+                    for x in sub:
+                        out.append(x)
+                else:
+                    out.append(r)
+        return out
+
+    func expand_include(self, key: str, visited: list[str], out: list[Rule]) -> unit:
+        if key in visited:
+            return
+        var v2: list[str] = []
+        for k in visited:
+            v2.append(k)
+        v2.append(key)
+        if key == "$self" or key == "$base":
+            let sub = self.expand(self.grammar.patterns, v2)
+            for x in sub:
+                out.append(x)
+            return
+        if key.starts_with("#"):
+            let name = key[1..<key.length]
+            if let rule = self.grammar.repository[name]:
+                if rule.is_group():
+                    let sub = self.expand(rule.patterns, v2)
+                    for x in sub:
+                        out.append(x)
+                else:
+                    out.append(rule)
+        # A "source.x" include names another grammar; that is resolved once a registry exists.
+
+    ## The innermost scope currently in force (a frame's contentName, else its name).
+    func deepest(self, stack: list[Frame]) -> str:
+        var i = stack.length - 1
+        while i >= 0:
+            let f = stack[i]
+            if f.content_scope != "":
+                return f.content_scope
+            if f.scope != "":
+                return f.scope
+            i -= 1
+        return ""
+
+    func fill(self, owner: list[str], a: int, b: int, scope: str) -> unit:
+        if scope == "":
+            return
+        var p = a if a >= 0 else 0
+        let stop = b if b <= owner.length else owner.length
+        while p < stop:
+            owner[p] = scope
+            p += 1
+
+    func apply_captures(self, owner: list[str], m: Match, caps: list[Capture]) -> unit:
+        for cap in caps:
+            let cs = m.group_start(cap.index)
+            let ce = m.group_end(cap.index)
+            if cs >= 0 and ce >= 0 and cap.scope != "":
+                self.fill(owner, cs, ce, cap.scope)
+
+    func build_end(self, src: str, m: Match, subject: list[str]) -> Regex?:
+        var out = ""
+        var i = 0
+        let n = src.length
+        while i < n:
+            let c = src[i..<i + 1]
+            if c == "\\" and i + 1 < n:
+                let d = src[i + 1..<i + 2]
+                if d >= "1" and d <= "9":
+                    out += escape_literal(capture_text(m, subject, digit(d)))
+                    i += 2
+                elif d == "k" and i + 2 < n and src[i + 2..<i + 3] == "<":
+                    var j = i + 3
+                    var name = ""
+                    while j < n and src[j..<j + 1] != ">":
+                        name += src[j..<j + 1]
+                        j += 1
+                    out += escape_literal(capture_text(m, subject, m.group_of(name)))
+                    i = j + 1
+                else:
+                    out += c + d
+                    i += 2
+            else:
+                out += c
+                i += 1
+        return compile_safe(out)
+
+# mark: Free helpers ==========================================================================
+
+func coalesce(owner: list[str], n: int) -> list[Span]:
+    var spans: list[Span] = []
+    var i = 0
+    while i < n:
+        let s = owner[i]
+        if s == "":
+            i += 1
+            continue
+        var j = i + 1
+        while j < n and owner[j] == s:
+            j += 1
+        spans.append(Span(i, j, s))
+        i = j
+    return spans
+
+func capture_text(m: Match, subject: list[str], index: int) -> str:
+    if index < 0:
+        return ""
+    let s = m.group_start(index)
+    let e = m.group_end(index)
+    if s < 0 or e < 0:
+        return ""
+    var out = ""
+    var i = s
+    while i < e:
+        out += subject[i]
+        i += 1
+    return out
+
+func escape_literal(text: str) -> str:
+    var out = ""
+    for ch in text:
+        if ch in ["\\", ".", "^", "$", "|", "?", "*", "+", "(", ")", "[", "]", "{", "}"]:
+            out += "\\"
+        out += ch
+    return out
+
+func digit(d: str) -> int:
+    var i = 0
+    while i < 10:
+        if "0123456789"[i..<i + 1] == d:
+            return i
+        i += 1
+    return 0
+
+# mark: Tests =================================================================================
+
+func toy() -> Grammar:
+    let g = Grammar()
+    g.scope_name = "source.toy"
+    g.patterns.append(ref_of(match_rule("\\b(let|if|else)\\b", "keyword.control.toy")))
+    g.patterns.append(ref_of(begin_end_rule("\"", "\"", "string.quoted.double.toy")))
+    g.patterns.append(ref_of(match_rule("#.*$", "comment.line.toy")))
+    g.patterns.append(ref_of(match_rule("\\b[0-9]+\\b", "constant.numeric.toy")))
+    return g
+
+func nested() -> Grammar:
+    let g = Grammar()
+    g.scope_name = "source.n"
+    let paren = begin_end_rule("\\(", "\\)", "meta.paren")
+    paren.patterns.append(include_of("$self"))
+    paren.patterns.append(ref_of(match_rule("[0-9]+", "num")))
+    g.patterns.append(ref_of(paren))
+    g.patterns.append(ref_of(match_rule("[0-9]+", "num")))
+    return g
+
+func render(g: Grammar, line: str) -> str:
+    let tok = Tokenizer(g)
+    let out = tok.run(scalars(line), tok.start_state())
+    var s = ""
+    for span in out.spans:
+        s += str(span.start) + "-" + str(span.end) + ":" + span.scope + ";"
+    return s
+
+test "tokenizer scopes keywords, numbers and comments":
+    let g = toy()
+    assert(render(g, "let x = 42  # hi") == "0-3:keyword.control.toy;8-10:constant.numeric.toy;12-16:comment.line.toy;")
+
+test "tokenizer spans a begin/end string region":
+    let g = toy()
+    assert(render(g, "x \"ab\" y") == "2-6:string.quoted.double.toy;")
+
+test "tokenizer nests regions and $self includes":
+    let g = nested()
+    assert(render(g, "(1 (2))") == "0-1:meta.paren;1-2:num;2-4:meta.paren;4-5:num;5-7:meta.paren;")
+
+test "tokenizer carries region state across lines":
+    let g = toy()
+    let tok = Tokenizer(g)
+    let first = tok.run(scalars("x \"open"), tok.start_state())
+    assert(first.state.signature() != tok.start_state().signature())
+    let second = tok.run(scalars("still\" y"), first.state)
+    assert(second.spans.length >= 1)
+    let span = second.spans[0]
+    assert(span.scope == "string.quoted.double.toy" and span.start == 0)

@@ -33,6 +33,7 @@ pub class Json:
     var text: str
     var items: list[Json]
     var obj: map[str, Json]
+    var key_order: list[str]
 
     func init(self, tag: int):
         self.tag = tag
@@ -40,6 +41,7 @@ pub class Json:
         self.text = ""
         self.items = []
         self.obj = {}
+        self.key_order = []
 
     pub func kind(self) -> int:
         return self.tag
@@ -96,6 +98,10 @@ pub class Json:
     ## The object member named `name`, or none.
     pub func get(self, name: str) -> Json?:
         return self.obj[name]
+
+    ## The object's member names, in the order they were parsed.
+    pub func keys(self) -> list[str]:
+        return self.key_order
 
     ## The text of the object member `name`, or `fallback` when it is absent or not a string.
     pub func text_of(self, name: str, fallback: str = "") -> str:
@@ -171,6 +177,7 @@ class Reader:
                 error(parse_error, "expected ':' after a key")
             self.i += 1
             node.obj[key] = try self.value()
+            node.key_order.append(key)
             self.skip_ws()
             let d = self.peek()
             if d == ",":
@@ -333,20 +340,20 @@ func index_in(s: str, ch: str) -> int:
         i += 1
     return 0
 
-## The one-scalar string for a codepoint, limited to NUL, the whitespace controls and printable
-## ASCII; every other control scalar and any codepoint of 128 or more returns "". The Luce
-## emitter spells other control scalars as byte escapes that Base rejects in a text literal.
+let ASCII_CTRL = "\u{0}\u{1}\u{2}\u{3}\u{4}\u{5}\u{6}\u{7}\u{8}\u{9}\u{a}\u{b}\u{c}\u{d}\u{e}\u{f}\u{10}\u{11}\u{12}\u{13}\u{14}\u{15}\u{16}\u{17}\u{18}\u{19}\u{1a}\u{1b}\u{1c}\u{1d}\u{1e}\u{1f}"
+let ASCII_PRINT = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+
+## The one-scalar string for a codepoint. The ASCII range comes from tables; a codepoint of 128
+## or more returns "" (grammar JSON is ASCII in practice) until a runtime scalar builder lands.
 func cp_to_str(cp: int) -> str:
-    if cp == 9:
-        return "\t"
-    if cp == 10:
-        return "\n"
-    if cp == 13:
-        return "\r"
-    if cp == 0:
-        return "\u{0}"
-    if cp >= 32 and cp < 127:
-        return " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"[cp - 32..<cp - 31]
+    if cp < 0:
+        return ""
+    if cp < 32:
+        return ASCII_CTRL[cp..<cp + 1]
+    if cp < 127:
+        return ASCII_PRINT[cp - 32..<cp - 31]
+    if cp == 127:
+        return "\u{7f}"
     return ""
 
 # mark: Tests =================================================================================
