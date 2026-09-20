@@ -28,6 +28,16 @@ pub class Span:
         self.end = end
         self.scope = scope
 
+## A candidate pattern paired with the grammar it belongs to, so an embedded grammar's `$self`
+## and repository references resolve against that grammar, not the host's.
+class Candidate:
+    let rule: Rule
+    let grammar: Grammar
+
+    func init(self, rule: Rule, grammar: Grammar):
+        self.rule = rule
+        self.grammar = grammar
+
 ## One open region on the tokenizer's stack: the scopes it contributes, its compiled end (or the
 ## `while` that holds it open), the captures for that delimiter, and the patterns active inside.
 class Frame:
@@ -38,7 +48,7 @@ class Frame:
     var end_captures: list[Capture]
     var apply_end_last: bool
     var end_src: str
-    var patterns: list[Rule]
+    var patterns: list[Candidate]
 
     func init(self):
         self.scope = ""
@@ -77,14 +87,19 @@ pub class Outcome:
 
 pub class Tokenizer:
     let grammar: Grammar
+    let registry: map[str, Grammar]
 
-    func init(self, grammar: Grammar):
+    ## `registry` maps a grammar's scopeName to the grammar, so `include`s of other languages
+    ## ("source.css", "text.html.basic#…") resolve for embedded highlighting. Pass an empty map
+    ## for a single self-contained grammar.
+    func init(self, grammar: Grammar, registry: map[str, Grammar]):
         self.grammar = grammar
+        self.registry = registry
 
     ## The state to start a document in: a single root region carrying the grammar's patterns.
     pub func start_state(self) -> State:
         let root = Frame()
-        root.patterns = self.expand(self.grammar.patterns, [])
+        root.patterns = self.expand(self.grammar.patterns, self.grammar, [])
         var frames: list[Frame] = []
         frames.append(root)
         return State(frames)
@@ -146,7 +161,7 @@ pub class Tokenizer:
         var best_start = n + 1
         var best_end = 0
         var best_match: Match? = none
-        var best_rule: Rule? = none
+        var best_candidate: Candidate? = none
         var best_is_end = false
         if not top.apply_end_last:
             if let e = top.end:
@@ -156,8 +171,9 @@ pub class Tokenizer:
                         best_end = m.finish()
                         best_match = m
                         best_is_end = true
-                        best_rule = none
-        for rule in top.patterns:
+                        best_candidate = none
+        for candidate in top.patterns:
+            let rule = candidate.rule
             let re = rule.matcher if rule.is_match() else rule.begin
             let r = re else continue
             if let m = r.search(subject, pos, pos):
@@ -166,7 +182,7 @@ pub class Tokenizer:
                     best_end = m.finish()
                     best_match = m
                     best_is_end = false
-                    best_rule = rule
+                    best_candidate = candidate
         if top.apply_end_last:
             if let e = top.end:
                 if let m = e.search(subject, pos, pos):
@@ -175,7 +191,7 @@ pub class Tokenizer:
                         best_end = m.finish()
                         best_match = m
                         best_is_end = true
-                        best_rule = none
+                        best_candidate = none
         let m = best_match else return -1
         self.fill(owner, pos, best_start, self.deepest(stack))
         if best_is_end:
@@ -184,7 +200,8 @@ pub class Tokenizer:
             self.apply_captures(owner, m, top.end_captures)
             discard(stack.pop())
             return best_end
-        let rule = best_rule else return -1
+        let candidate = best_candidate else return -1
+        let rule = candidate.rule
         if rule.is_match():
             let base = rule.scope if rule.scope != "" else self.deepest(stack)
             self.fill(owner, best_start, best_end, base)
@@ -199,7 +216,7 @@ pub class Tokenizer:
         frame.end_captures = rule.end_captures
         frame.apply_end_last = rule.apply_end_last
         frame.end_src = rule.end_src
-        frame.patterns = self.expand(rule.patterns, [])
+        frame.patterns = self.expand(rule.patterns, candidate.grammar, [])
         if rule.is_while:
             frame.while_rgx = rule.while_rgx
         elif rule.end_has_backref:
@@ -211,42 +228,56 @@ pub class Tokenizer:
 
     ## Splice includes into a flat list of concrete rules (those with a `match` or `begin`),
     ## following $self/$base and #name, and inlining grouping rules. A visited set guards cycles.
-    func expand(self, refs: list[PatternRef], visited: list[str]) -> list[Rule]:
-        var out: list[Rule] = []
+    func expand(self, refs: list[PatternRef], grammar: Grammar, visited: list[str]) -> list[Candidate]:
+        var out: list[Candidate] = []
         for ref in refs:
             if ref.include != "":
-                self.expand_include(ref.include, visited, out)
+                self.expand_include(ref.include, grammar, visited, out)
             elif let r = ref.rule:
                 if r.is_group():
-                    let sub = self.expand(r.patterns, visited)
+                    let sub = self.expand(r.patterns, grammar, visited)
                     for x in sub:
                         out.append(x)
                 else:
-                    out.append(r)
+                    out.append(Candidate(r, grammar))
         return out
 
-    func expand_include(self, key: str, visited: list[str], out: list[Rule]) -> unit:
-        if key in visited:
+    ## Resolve one include against `grammar`: `$self`/`$base` and `#name` stay in the grammar;
+    ## `source.x`/`source.x#name` cross into another grammar from the registry (embedded
+    ## languages). Visited keys are grammar-scoped so the same include name in two grammars does
+    ## not block itself.
+    func expand_include(self, key: str, grammar: Grammar, visited: list[str], out: list[Candidate]) -> unit:
+        let mark = grammar.scope_name + "\u{1}" + key
+        if mark in visited:
             return
         var v2: list[str] = []
         for k in visited:
             v2.append(k)
-        v2.append(key)
+        v2.append(mark)
         if key == "$self" or key == "$base":
-            let sub = self.expand(self.grammar.patterns, v2)
-            for x in sub:
-                out.append(x)
+            self.add_all(self.expand(grammar.patterns, grammar, v2), out)
             return
         if key.starts_with("#"):
-            let name = key[1..<key.length]
-            if let rule = self.grammar.repository[name]:
-                if rule.is_group():
-                    let sub = self.expand(rule.patterns, v2)
-                    for x in sub:
-                        out.append(x)
-                else:
-                    out.append(rule)
-        # A "source.x" include names another grammar; that is resolved once a registry exists.
+            self.add_repo(grammar, key[1..<key.length], grammar, v2, out)
+            return
+        let parts = key.split("#")
+        let scope = parts[0]
+        let other = self.registry[scope] else return
+        if parts.length > 1:
+            self.add_repo(other, parts[1], other, v2, out)
+        else:
+            self.add_all(self.expand(other.patterns, other, v2), out)
+
+    func add_repo(self, source: Grammar, name: str, grammar: Grammar, visited: list[str], out: list[Candidate]) -> unit:
+        let rule = source.repository[name] else return
+        if rule.is_group():
+            self.add_all(self.expand(rule.patterns, grammar, visited), out)
+        else:
+            out.append(Candidate(rule, grammar))
+
+    func add_all(self, items: list[Candidate], out: list[Candidate]) -> unit:
+        for x in items:
+            out.append(x)
 
     ## The innermost scope currently in force (a frame's contentName, else its name).
     func deepest(self, stack: list[Frame]) -> str:
@@ -372,12 +403,24 @@ func nested() -> Grammar:
     return g
 
 func render(g: Grammar, line: str) -> str:
-    let tok = Tokenizer(g)
+    return render_with(g, {}, line)
+
+func render_with(g: Grammar, registry: map[str, Grammar], line: str) -> str:
+    let tok = Tokenizer(g, registry)
     let out = tok.run(scalars(line), tok.start_state())
     var s = ""
     for span in out.spans:
         s += str(span.start) + "-" + str(span.end) + ":" + span.scope + ";"
     return s
+
+## An outer grammar with a <t>…</t> region that embeds another language by `include`.
+func embedded() -> Grammar:
+    let g = Grammar()
+    g.scope_name = "source.outer"
+    let region = begin_end_rule("<t>", "</t>", "meta.embed.outer")
+    region.patterns.append(include_of("source.toy"))
+    g.patterns.append(ref_of(region))
+    return g
 
 test "tokenizer scopes keywords, numbers and comments":
     let g = toy()
@@ -391,9 +434,14 @@ test "tokenizer nests regions and $self includes":
     let g = nested()
     assert(render(g, "(1 (2))") == "0-1:meta.paren;1-2:num;2-4:meta.paren;4-5:num;5-7:meta.paren;")
 
+test "tokenizer resolves embedded grammars via source.x includes":
+    var registry: map[str, Grammar] = {}
+    registry["source.toy"] = toy()
+    assert(render_with(embedded(), registry, "<t>let x</t>") == "0-3:meta.embed.outer;3-6:keyword.control.toy;6-12:meta.embed.outer;")
+
 test "tokenizer carries region state across lines":
     let g = toy()
-    let tok = Tokenizer(g)
+    let tok = Tokenizer(g, {})
     let first = tok.run(scalars("x \"open"), tok.start_state())
     assert(first.state.signature() != tok.start_state().signature())
     let second = tok.run(scalars("still\" y"), first.state)
