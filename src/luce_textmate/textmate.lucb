@@ -1,0 +1,957 @@
+#==============================================================================================
+#
+#   textmate - a TextMate grammar model and line tokenizer, in luce-base
+#
+#   DESCRIPTION:
+#       Loads a `.tmLanguage.json` grammar (parsed with luce-json) into a compact model — an arena
+#       of interned strings plus index-linked pools of rules, pattern references and captures —
+#       and tokenizes a whole document line by line, returning scoped spans an editor colours
+#       through its theme. Each pattern is compiled to a luce-regex `Regex`; a pattern the engine
+#       cannot parse becomes inert rather than failing the grammar. Grammar and Tokenizer are
+#       exposed to Luce through interop; everything the tokenizer touches per line is plain Base
+#       memory, so the hot path never crosses the interop boundary.
+#
+#       This version tokenizes a self-contained grammar (no cross-grammar `source.x` embedding yet)
+#       and re-tokenizes the whole document on each call, which the fast engine makes affordable;
+#       a wall-clock budget leaves a very large file's tail plain rather than blocking.
+#
+#==============================================================================================
+
+import memory
+import utf8
+import interop
+import strings
+import time
+import regex
+import json
+
+## A grammar whose JSON did not describe a usable rule set.
+pub let grammar_error: ErrorCode = ErrorCode.package(332)
+
+# Rule kinds.
+let R_MATCH: u8 = 0
+let R_BEGIN: u8 = 1
+let R_GROUP: u8 = 2
+
+# A visited marker standing for "$self"/"$base" (not a valid rule index).
+let TOP_MARK: i32 = -7
+
+## Very long lines are left uncoloured: matching every pattern across them costs more than the
+## result is worth, and a minified blob rarely wants highlighting anyway.
+let MAX_LINE: i32 = 20000
+
+## A single tokenize call never runs longer than this; the file's tail is left plain.
+let BUDGET_NS: i64 = 120000000
+
+# mark: A growable vector =====================================================================
+
+struct Vec[T]:
+    var data: T[]
+    var used: usize = 0
+
+    mutating func ensure(count: usize) -> !:
+        if count <= self.data.length:
+            return
+        var capacity: usize = 8 if self.data.length == 0 else self.data.length * 2
+        while capacity < count:
+            capacity = capacity * 2
+        let grown = try alloc T[capacity] in memory.heap
+        var i: usize = 0
+        while i < self.used:
+            grown[i] = self.data[i]
+            i += 1
+        if self.data.length > 0:
+            free(self.data) in memory.heap
+        self.data = grown
+
+    mutating func push(value: T) -> usize!:
+        try self.ensure(self.used + 1)
+        self.data[self.used] = value
+        self.used += 1
+        return self.used - 1
+
+    mutating func free_all():
+        if self.data.length > 0:
+            free(self.data) in memory.heap
+        var empty: T[]
+        self.data = empty
+        self.used = 0
+
+# mark: The grammar model =====================================================================
+
+## A slice into a grammar's string arena.
+struct Str:
+    var off: i32 = 0
+    var len: i32 = 0
+
+## The scope assigned to one capture group of a rule's regex (linked list).
+struct Capture:
+    var index: i32 = 0
+    var scope: Str = Str()
+    var next: i32 = -1
+
+## A reference inside a `patterns` list: an inline/repository rule, or an include (linked list).
+struct PatternRef:
+    var rule: i32 = -1
+    var include: Str = Str()
+    var next: i32 = -1
+
+## A repository entry (name -> rule index).
+struct RepoEntry:
+    var name: Str = Str()
+    var rule: i32 = 0
+
+## One rule: a `match`, a `begin`/`end` (or `begin`/`while`) region, or a grouping holder.
+struct Rule:
+    var kind: u8 = 2
+    var scope: Str = Str()
+    var content_scope: Str = Str()
+    var matcher: regex.Regex*? = none
+    var begin: regex.Regex*? = none
+    var end_src: Str = Str()
+    var end: regex.Regex*? = none
+    var end_has_backref: bool = false
+    var is_while: bool = false
+    var while_rgx: regex.Regex*? = none
+    var captures_head: i32 = -1
+    var begin_captures_head: i32 = -1
+    var end_captures_head: i32 = -1
+    var patterns_head: i32 = -1
+    var apply_end_last: bool = false
+
+## A whole grammar. It owns its string arena, rule/pattern/capture pools, and every compiled
+## `Regex` those rules hold.
+pub struct Grammar:
+    var arena: Vec[u8]
+    var rules: Vec[Rule]
+    var patrefs: Vec[PatternRef]
+    var captures: Vec[Capture]
+    var file_types: Vec[Str]
+    var repo: Vec[RepoEntry]
+    var scope_name: Str = Str()
+    var top_patterns: i32
+
+    pub func init() -> !:
+        self.arena = Vec[u8]()
+        self.rules = Vec[Rule]()
+        self.patrefs = Vec[PatternRef]()
+        self.captures = Vec[Capture]()
+        self.file_types = Vec[Str]()
+        self.repo = Vec[RepoEntry]()
+        self.scope_name = Str()
+        self.top_patterns = -1
+
+    # -- arena ---------------------------------------------------------------------------------
+
+    mutating func intern(text: str) -> Str!:
+        let off = (i32)self.arena.used
+        let bytes = text.bytes
+        var i: usize = 0
+        while i < bytes.length:
+            discard(try self.arena.push(bytes[i]))
+            i += 1
+        return Str(off = off, len = (i32)bytes.length)
+
+    func text(span: Str) -> str:
+        if span.len <= 0:
+            return ""
+        return (str)self.arena.data[(usize)span.off..<(usize)(span.off + span.len)]
+
+    # -- loading -------------------------------------------------------------------------------
+
+    mutating func parse(source: str) -> !:
+        let document = try json.decode(source, 33554432)
+        defer document.release()
+        let root = (try document.get()).root()
+        if let name = root.member("scopeName"):
+            if let value = name.text():
+                self.scope_name = try self.intern(value)
+        if let types = root.member("fileTypes"):
+            var i: usize = 0
+            while i < types.length():
+                if let entry = types.at(i):
+                    if let value = entry.text():
+                        discard(try self.file_types.push(try self.intern(value)))
+                i += 1
+        self.top_patterns = try self.build_patterns(root.member("patterns"))
+        if let repository = root.member("repository"):
+            var i: usize = 0
+            let count = repository.member_count()
+            while i < count:
+                let name = repository.member_name(i) else ""
+                if let entry = repository.member_value(i):
+                    let interned = try self.intern(name)
+                    let rule_index = try self.build_rule(entry)
+                    discard(try self.repo.push(RepoEntry(name = interned, rule = rule_index)))
+                i += 1
+
+    ## Build a `patterns` array into a linked list; returns the head index (-1 when empty).
+    mutating func build_patterns(node: json.View?) -> i32!:
+        let array = node else return -1
+        if array.kind() != json.Kind.array:
+            return -1
+        var head: i32 = -1
+        var tail: i32 = -1
+        var i: usize = 0
+        let count = array.length()
+        while i < count:
+            if let item = array.at(i):
+                let ref_index = try self.patrefs.push(PatternRef())
+                if let include = item.member("include"):
+                    if let value = include.text():
+                        self.patrefs.data[ref_index].include = try self.intern(value)
+                else:
+                    let rule_index = try self.build_rule(item)
+                    self.patrefs.data[ref_index].rule = rule_index
+                if head == -1:
+                    head = (i32)ref_index
+                else:
+                    self.patrefs.data[(usize)tail].next = (i32)ref_index
+                tail = (i32)ref_index
+            i += 1
+        return head
+
+    mutating func build_rule(node: json.View) -> i32!:
+        let rule_index = try self.rules.push(Rule())
+        var scope = Str()
+        var content = Str()
+        if let name = node.member("name"):
+            if let value = name.text():
+                scope = try self.intern(value)
+        if let name = node.member("contentName"):
+            if let value = name.text():
+                content = try self.intern(value)
+        self.rules.data[rule_index].scope = scope
+        self.rules.data[rule_index].content_scope = content
+        if let matched = node.member("match"):
+            let compiled = self.compile_safe(matched.text() else "")
+            let captures = try self.build_captures(node.member("captures"))
+            self.rules.data[rule_index].kind = R_MATCH
+            self.rules.data[rule_index].matcher = compiled
+            self.rules.data[rule_index].captures_head = captures
+            return (i32)rule_index
+        if let begin = node.member("begin"):
+            let compiled = self.compile_safe(begin.text() else "")
+            let begin_caps = try self.build_captures(self.first(node, "beginCaptures", "captures"))
+            self.rules.data[rule_index].kind = R_BEGIN
+            self.rules.data[rule_index].begin = compiled
+            self.rules.data[rule_index].begin_captures_head = begin_caps
+            if let end = node.member("end"):
+                let end_source = end.text() else ""
+                let interned = try self.intern(end_source)
+                let backref = has_backref(end_source)
+                self.rules.data[rule_index].end_src = interned
+                self.rules.data[rule_index].end_has_backref = backref
+                if not backref:
+                    self.rules.data[rule_index].end = self.compile_safe(end_source)
+                let end_caps = try self.build_captures(self.first(node, "endCaptures", "captures"))
+                self.rules.data[rule_index].end_captures_head = end_caps
+            elif let while_node = node.member("while"):
+                self.rules.data[rule_index].is_while = true
+                self.rules.data[rule_index].while_rgx = self.compile_safe(while_node.text() else "")
+                let while_caps = try self.build_captures(self.first(node, "whileCaptures", "captures"))
+                self.rules.data[rule_index].end_captures_head = while_caps
+            self.rules.data[rule_index].apply_end_last = bool_of(node.member("applyEndPatternLast"))
+            let patterns = try self.build_patterns(node.member("patterns"))
+            self.rules.data[rule_index].patterns_head = patterns
+            return (i32)rule_index
+        self.rules.data[rule_index].kind = R_GROUP
+        let patterns = try self.build_patterns(node.member("patterns"))
+        self.rules.data[rule_index].patterns_head = patterns
+        return (i32)rule_index
+
+    ## Capture specs are an object keyed by group number; probe a range of indices so the order of
+    ## members in the JSON does not matter. Returns the head of a linked capture list.
+    mutating func build_captures(node: json.View?) -> i32!:
+        let object = node else return -1
+        if object.kind() != json.Kind.object:
+            return -1
+        var head: i32 = -1
+        var tail: i32 = -1
+        var i: i32 = 0
+        while i < 64:
+            var key: u8[8]
+            let name = try format(key, f"{i}")
+            if let capture = object.member(name):
+                if let scope_node = capture.member("name"):
+                    if let scope_text = scope_node.text():
+                        if scope_text != "":
+                            let scope = try self.intern(scope_text)
+                            let cap_index = try self.captures.push(Capture(index = i, scope = scope))
+                            if head == -1:
+                                head = (i32)cap_index
+                            else:
+                                self.captures.data[(usize)tail].next = (i32)cap_index
+                            tail = (i32)cap_index
+            i += 1
+        return head
+
+    func first(node: json.View, a: str, b: str) -> json.View?:
+        if let value = node.member(a):
+            return value
+        return node.member(b)
+
+    ## Compile a pattern, or none when empty or unparseable, so one exotic pattern does not sink
+    ## the whole grammar.
+    func compile_safe(pattern: str) -> regex.Regex*?:
+        if pattern == "":
+            return none
+        let compiled = new regex.Regex(pattern, false) catch failure:
+            return none
+        return compiled
+
+    func repo_lookup(name: str) -> i32:
+        var i: usize = 0
+        while i < self.repo.used:
+            let entry = self.repo.data[i]
+            if self.text(entry.name) == name:
+                return entry.rule
+            i += 1
+        return -1
+
+    # -- accessors (interop) -------------------------------------------------------------------
+
+    ## The grammar's scope name (e.g. "source.python").
+    pub func scope() -> str:
+        return self.text(self.scope_name)
+
+    ## The number of file extensions the grammar declares.
+    pub func file_type_count() -> i32:
+        return (i32)self.file_types.used
+
+    ## The file extension at `index` (without a dot), or "".
+    pub func file_type(index: i32) -> str:
+        if index < 0 or (usize)index >= self.file_types.used:
+            return ""
+        return self.text(self.file_types.data[(usize)index])
+
+    # -- teardown ------------------------------------------------------------------------------
+
+    pub mutating func close():
+        self.dispose()
+
+    mutating func dispose():
+        var i: usize = 0
+        while i < self.rules.used:
+            let rule = self.rules.data[i]
+            if let r = rule.matcher:
+                r.close()
+                free(r)
+            if let r = rule.begin:
+                r.close()
+                free(r)
+            if let r = rule.end:
+                r.close()
+                free(r)
+            if let r = rule.while_rgx:
+                r.close()
+                free(r)
+            i += 1
+        self.rules.free_all()
+        self.arena.free_all()
+        self.patrefs.free_all()
+        self.captures.free_all()
+        self.file_types.free_all()
+        self.repo.free_all()
+
+    static func own(native: Grammar*) -> interop.Reference[Grammar]!:
+        return try interop.Reference[Grammar].adopt(native, grammar_type)
+
+## The interop type of a loaded `Grammar`.
+pub let grammar_type: interop.Type[Grammar] = interop.Type[Grammar]("TextMate grammar", Grammar.close, closeable = true)
+
+## Load a grammar from its `.tmLanguage.json` text.
+pub func load(source: str) -> interop.Reference[Grammar]!:
+    let native = try new Grammar()
+    native.parse(source) catch failure:
+        native.dispose()
+        free(native)
+        error(failure.code, failure.message)
+    return try Grammar.own(native)
+
+# mark: The tokenizer =========================================================================
+
+## One coloured run of the document: codepoints [start, end) carry the innermost `scope`.
+struct OutSpan:
+    var start: i32 = 0
+    var end: i32 = 0
+    var scope: Str = Str()
+
+## One open region on the tokenizer's stack. Expanded patterns live as a slice [pat_start,
+## pat_start+pat_count) of the shared, stack-ordered `frame_pats` pool.
+struct Frame:
+    var scope: Str = Str()
+    var content_scope: Str = Str()
+    var end: regex.Regex*? = none
+    var owns_end: bool = false
+    var while_rgx: regex.Regex*? = none
+    var end_captures_head: i32 = -1
+    var apply_end_last: bool = false
+    var end_src: Str = Str()
+    var pat_start: i32 = 0
+    var pat_count: i32 = 0
+
+## Tokenizes a whole document for one grammar and holds the resulting spans for the caller to
+## read. Re-tokenizing replaces the spans. All per-line work is plain Base memory.
+pub struct Tokenizer:
+    var grammar_ref: interop.Reference[Grammar]
+    var grammar: Grammar*
+    # Whole-document codepoints and the output spans.
+    var all: Vec[u32]
+    var spans: Vec[OutSpan]
+    # The live region stack and its expanded-pattern pool (stack-ordered).
+    var stack: Vec[Frame]
+    var frame_pats: Vec[i32]
+    var visited: Vec[i32]
+    var frame_gen: i32
+    # Per-line owner array (the scope in force at each codepoint).
+    var owner: Vec[Str]
+    # Per-line match cache for the top frame.
+    var c_gen: i32
+    var c_start: Vec[i32]
+    var c_end_start: i32
+    # Scratch for building backreference end patterns.
+    var build: Vec[u8]
+
+    func init(grammar_ref: interop.Reference[Grammar]) -> !:
+        self.grammar_ref = grammar_ref.clone()
+        self.grammar = try grammar_ref.get()
+        self.all = Vec[u32]()
+        self.spans = Vec[OutSpan]()
+        self.stack = Vec[Frame]()
+        self.frame_pats = Vec[i32]()
+        self.visited = Vec[i32]()
+        self.frame_gen = 0
+        self.owner = Vec[Str]()
+        self.c_gen = -1
+        self.c_start = Vec[i32]()
+        self.c_end_start = -1
+        self.build = Vec[u8]()
+
+    ## Tokenize the whole document `text`. Returns the number of spans, readable with the span
+    ## accessors. Colours from the top of the file down; a very large file's tail may be left
+    ## plain when the time budget is spent.
+    pub mutating func tokenize(text: str) -> i32!:
+        self.spans.used = 0
+        self.all.used = 0
+        try self.decode_text(text)
+        self.clear_stack()
+        var root = Frame()
+        self.frame_pats.used = 0
+        try self.expand_into(self.grammar.top_patterns)
+        root.pat_start = 0
+        root.pat_count = (i32)self.frame_pats.used
+        discard(try self.stack.push(root))
+        self.frame_gen = 0
+        let started = time_now()
+        let total = self.all.used
+        var line_start: usize = 0
+        while true:
+            var line_end = line_start
+            while line_end < total and self.all.data[line_end] != (u32)'\n':
+                line_end += 1
+            if (i32)(line_end - line_start) <= MAX_LINE:
+                try self.tokenize_line(line_start, line_end)
+            if line_end >= total:
+                break
+            line_start = line_end + 1
+            if time_since(started) > BUDGET_NS:
+                break
+        self.clear_stack()
+        return (i32)self.spans.used
+
+    mutating func decode_text(text: str) -> !:
+        let bytes = text.bytes
+        var offset: usize = 0
+        while offset < bytes.length:
+            if let decoded = utf8.decode(bytes, offset):
+                discard(try self.all.push((u32)decoded.scalar))
+                offset += decoded.width
+            else:
+                discard(try self.all.push((u32)bytes[offset]))
+                offset += 1
+
+    mutating func tokenize_line(ls: usize, le: usize) -> !:
+        let subject = self.all.data[ls..<le]
+        let n = (i32)(le - ls)
+        let base = (i32)ls
+        try self.reset_owner(n)
+        self.c_gen = -1
+        var pos = self.enter_line(subject)
+        var guard: i32 = 0
+        let limit = n * 6 + 64
+        while pos <= n:
+            guard += 1
+            if guard > limit:
+                break
+            let before = (i32)self.stack.used
+            let advanced = try self.step(subject, pos, n)
+            if advanced < 0:
+                break
+            if advanced == pos and (i32)self.stack.used == before:
+                pos += 1
+            else:
+                pos = advanced
+        if pos < n:
+            self.fill(pos, n, self.deepest())
+        try self.coalesce(base, n)
+
+    ## At line start, keep or drop `while` regions: each must still match, or it and everything
+    ## nested inside it closes. Returns the position after any consumed `while` delimiters.
+    mutating func enter_line(subject: const u32[]) -> i32:
+        var p: i32 = 0
+        var i: usize = 0
+        while i < self.stack.used:
+            let frame = self.stack.data[i]
+            if let w = frame.while_rgx:
+                if w.match_at(subject, p, p):
+                    self.fill(p, w.match_end(), self.deepest())
+                    self.apply_captures(w, frame.end_captures_head)
+                    p = w.match_end()
+                else:
+                    while self.stack.used > i:
+                        self.pop_frame()
+                    return p
+            i += 1
+        return p
+
+    ## Refresh the top frame's match cache at `pos`: rebuild it when the frame changed, then make
+    ## sure every candidate's and the end's next match is known at or after `pos`. A cached match
+    ## that still starts at or after `pos` is reused; a consumed, never-searched or `\G` match is
+    ## searched again. This keeps a line's work linear in its length.
+    mutating func refresh(top: Frame, subject: const u32[], pos: i32) -> !:
+        if self.c_gen != self.frame_gen:
+            self.c_gen = self.frame_gen
+            self.c_start.used = 0
+            var k: i32 = 0
+            while k < top.pat_count:
+                discard(try self.c_start.push(-2))
+                k += 1
+            self.c_end_start = -2
+        if let e = top.end:
+            if self.c_end_start == -2 or (self.c_end_start >= 0 and self.c_end_start < pos) or e.uses_g():
+                if e.search(subject, pos, pos):
+                    self.c_end_start = e.match_start()
+                else:
+                    self.c_end_start = -1
+        else:
+            self.c_end_start = -1
+        var i: i32 = 0
+        while i < top.pat_count:
+            let rule_index = self.frame_pats.data[(usize)(top.pat_start + i)]
+            let rule = self.grammar.rules.data[(usize)rule_index]
+            let re = rule.matcher if rule.kind == R_MATCH else rule.begin
+            if let r = re:
+                let cs = self.c_start.data[(usize)i]
+                if cs == -2 or (cs >= 0 and cs < pos) or r.uses_g():
+                    if r.search(subject, pos, pos):
+                        self.c_start.data[(usize)i] = r.match_start()
+                    else:
+                        self.c_start.data[(usize)i] = -1
+            else:
+                self.c_start.data[(usize)i] = -1
+            i += 1
+
+    ## Take one step from `pos`: colour up to the leftmost match, then apply it (a match rule, a
+    ## region begin, or the current region's end). Returns the new position, or -1 when nothing on
+    ## the rest of the line matches.
+    mutating func step(subject: const u32[], pos: i32, n: i32) -> i32!:
+        let top = self.stack.data[self.stack.used - 1]
+        try self.refresh(top, subject, pos)
+        var best_start = n + 1
+        var best_end: i32 = 0
+        var best_slot: i32 = -1
+        var best_is_end = false
+        var have = false
+        if not top.apply_end_last and self.c_end_start >= 0 and self.c_end_start < best_start:
+            if let e = top.end:
+                best_start = self.c_end_start
+                best_end = e.match_end()
+                best_is_end = true
+                have = true
+        var i: i32 = 0
+        while i < top.pat_count:
+            let cs = self.c_start.data[(usize)i]
+            if cs >= 0 and cs < best_start:
+                let rule_index = self.frame_pats.data[(usize)(top.pat_start + i)]
+                let rule = self.grammar.rules.data[(usize)rule_index]
+                let re = rule.matcher if rule.kind == R_MATCH else rule.begin
+                if let r = re:
+                    best_start = cs
+                    best_end = r.match_end()
+                    best_is_end = false
+                    best_slot = i
+                    have = true
+            i += 1
+        if top.apply_end_last and self.c_end_start >= 0 and self.c_end_start < best_start:
+            if let e = top.end:
+                best_start = self.c_end_start
+                best_end = e.match_end()
+                best_is_end = true
+                best_slot = -1
+                have = true
+        if not have:
+            return -1
+        self.fill(pos, best_start, self.deepest())
+        if best_is_end:
+            self.fill(best_start, best_end, self.deepest())
+            if let e = top.end:
+                self.apply_captures(e, top.end_captures_head)
+            self.pop_frame()
+            return best_end
+        let rule_index = self.frame_pats.data[(usize)(top.pat_start + best_slot)]
+        let rule = self.grammar.rules.data[(usize)rule_index]
+        let re = rule.matcher if rule.kind == R_MATCH else rule.begin
+        let r = re else return -1
+        if rule.kind == R_MATCH:
+            let base_scope = rule.scope if rule.scope.len > 0 else self.deepest()
+            self.fill(best_start, best_end, base_scope)
+            self.apply_captures(r, rule.captures_head)
+            return best_end
+        let base_scope = rule.scope if rule.scope.len > 0 else self.deepest()
+        self.fill(best_start, best_end, base_scope)
+        self.apply_captures(r, rule.begin_captures_head)
+        try self.push_region(rule, r, subject)
+        return best_end
+
+    mutating func push_region(rule: Rule, m: regex.Regex*, subject: const u32[]) -> !:
+        var frame = Frame()
+        frame.scope = rule.scope
+        frame.content_scope = rule.content_scope
+        frame.end_captures_head = rule.end_captures_head
+        frame.apply_end_last = rule.apply_end_last
+        frame.end_src = rule.end_src
+        frame.pat_start = (i32)self.frame_pats.used
+        try self.expand_into(rule.patterns_head)
+        frame.pat_count = (i32)self.frame_pats.used - frame.pat_start
+        if rule.is_while:
+            frame.while_rgx = rule.while_rgx
+        elif rule.end_has_backref:
+            frame.end = self.build_end(self.grammar.text(rule.end_src), m, subject)
+            frame.owns_end = true
+        else:
+            frame.end = rule.end
+        discard(try self.stack.push(frame))
+        self.frame_gen += 1
+
+    mutating func pop_frame():
+        if self.stack.used == 0:
+            return
+        let top = self.stack.data[self.stack.used - 1]
+        if top.owns_end:
+            if let e = top.end:
+                e.close()
+                free(e)
+        self.frame_pats.used = (usize)top.pat_start
+        self.stack.used -= 1
+        self.frame_gen += 1
+
+    mutating func clear_stack():
+        while self.stack.used > 0:
+            self.pop_frame()
+        self.frame_pats.used = 0
+
+    # -- include expansion ---------------------------------------------------------------------
+
+    ## Expand a rule's `patterns` (following includes, inlining groups) into `frame_pats`.
+    mutating func expand_into(head: i32) -> !:
+        self.visited.used = 0
+        try self.expand_refs(head)
+
+    mutating func expand_refs(head: i32) -> !:
+        var pr = head
+        while pr != -1:
+            let ref = self.grammar.patrefs.data[(usize)pr]
+            if ref.include.len > 0:
+                try self.expand_include(self.grammar.text(ref.include))
+            elif ref.rule >= 0:
+                let rule = self.grammar.rules.data[(usize)ref.rule]
+                if rule.kind == R_GROUP:
+                    try self.expand_refs(rule.patterns_head)
+                else:
+                    discard(try self.frame_pats.push(ref.rule))
+            pr = ref.next
+
+    mutating func expand_include(key: str) -> !:
+        if key == "$self" or key == "$base":
+            if not self.seen(TOP_MARK):
+                discard(try self.visited.push(TOP_MARK))
+                try self.expand_refs(self.grammar.top_patterns)
+            return
+        if strings.starts_with(key, "#"):
+            let name = byte_slice(key, 1)
+            let rule_index = self.grammar.repo_lookup(name)
+            if rule_index >= 0 and not self.seen(rule_index):
+                discard(try self.visited.push(rule_index))
+                let rule = self.grammar.rules.data[(usize)rule_index]
+                if rule.kind == R_GROUP:
+                    try self.expand_refs(rule.patterns_head)
+                else:
+                    discard(try self.frame_pats.push(rule_index))
+            return
+        # "source.x" / "source.x#name": cross-grammar embedding is not resolved in this version.
+
+    func seen(mark: i32) -> bool:
+        var i: usize = 0
+        while i < self.visited.used:
+            if self.visited.data[i] == mark:
+                return true
+            i += 1
+        return false
+
+    # -- colouring -----------------------------------------------------------------------------
+
+    ## The innermost scope in force (a frame's contentName, else its name).
+    func deepest() -> Str:
+        var i = (i32)self.stack.used - 1
+        while i >= 0:
+            let frame = self.stack.data[(usize)i]
+            if frame.content_scope.len > 0:
+                return frame.content_scope
+            if frame.scope.len > 0:
+                return frame.scope
+            i -= 1
+        return Str()
+
+    mutating func reset_owner(n: i32) -> !:
+        try self.owner.ensure((usize)n)
+        var i: usize = 0
+        while i < (usize)n:
+            self.owner.data[i] = Str()
+            i += 1
+        self.owner.used = (usize)n
+
+    mutating func fill(a: i32, b: i32, scope: Str):
+        if scope.len <= 0:
+            return
+        var p = a if a >= 0 else 0
+        let stop = b if (usize)b <= self.owner.used else (i32)self.owner.used
+        while p < stop:
+            self.owner.data[(usize)p] = scope
+            p += 1
+
+    mutating func apply_captures(m: regex.Regex*, head: i32):
+        var c = head
+        while c != -1:
+            let capture = self.grammar.captures.data[(usize)c]
+            let cs = m.group_start(capture.index)
+            let ce = m.group_end(capture.index)
+            if cs >= 0 and ce >= 0 and capture.scope.len > 0:
+                self.fill(cs, ce, capture.scope)
+            c = capture.next
+
+    mutating func coalesce(base: i32, n: i32) -> !:
+        var i: i32 = 0
+        while i < n:
+            let scope = self.owner.data[(usize)i]
+            if scope.len <= 0:
+                i += 1
+                continue
+            var j = i + 1
+            while j < n and same_scope(self.owner.data[(usize)j], scope):
+                j += 1
+            discard(try self.spans.push(OutSpan(start = base + i, end = base + j, scope = scope)))
+            i = j
+
+    ## Build a region's `end` regex, substituting the begin match's captures for `\1`..`\9` and
+    ## `\k<name>` in the source. Returns none when the result cannot be compiled.
+    mutating func build_end(src: str, m: regex.Regex*, subject: const u32[]) -> regex.Regex*?:
+        self.build.used = 0
+        let bytes = src.bytes
+        var i: usize = 0
+        let n = bytes.length
+        var ok = true
+        while i < n and ok:
+            let c = bytes[i]
+            if c == (u8)'\\' and i + 1 < n:
+                let d = bytes[i + 1]
+                if d >= (u8)'1' and d <= (u8)'9':
+                    self.append_capture(m, subject, (i32)(d - (u8)'0')) catch _: ok = false
+                    i += 2
+                elif d == (u8)'k' and i + 2 < n and bytes[i + 2] == (u8)'<':
+                    var j = i + 3
+                    while j < n and bytes[j] != (u8)'>':
+                        j += 1
+                    let name = byte_slice2(src, i + 3, j)
+                    self.append_capture(m, subject, m.group_of(name)) catch _: ok = false
+                    i = j + 1
+                else:
+                    self.append_byte(c) catch _: ok = false
+                    self.append_byte(d) catch _: ok = false
+                    i += 2
+            else:
+                self.append_byte(c) catch _: ok = false
+                i += 1
+        if not ok:
+            return none
+        let source = (str)self.build.data[..<self.build.used]
+        let compiled = new regex.Regex(source, false) catch failure:
+            return none
+        return compiled
+
+    mutating func append_byte(b: u8) -> !:
+        discard(try self.build.push(b))
+
+    ## Append the matched text of group `index`, with regex metacharacters escaped.
+    mutating func append_capture(m: regex.Regex*, subject: const u32[], index: i32) -> !:
+        if index < 0:
+            return
+        let cs = m.group_start(index)
+        let ce = m.group_end(index)
+        if cs < 0 or ce < 0:
+            return
+        var buffer: u8[4]
+        var k = cs
+        while k < ce:
+            if is_meta(subject[(usize)k]):
+                try self.append_byte((u8)'\\')
+            let width = utf8.encode(subject[(usize)k], buffer) else 0
+            var w: usize = 0
+            while w < width:
+                try self.append_byte(buffer[w])
+                w += 1
+            k += 1
+
+    # -- span accessors (interop) --------------------------------------------------------------
+
+    ## The number of spans from the last tokenize call.
+    pub func span_count() -> i32:
+        return (i32)self.spans.used
+
+    ## The start codepoint offset of span `index`.
+    pub func span_start(index: i32) -> i32:
+        if index < 0 or (usize)index >= self.spans.used:
+            return 0
+        return self.spans.data[(usize)index].start
+
+    ## The end codepoint offset of span `index`.
+    pub func span_end(index: i32) -> i32:
+        if index < 0 or (usize)index >= self.spans.used:
+            return 0
+        return self.spans.data[(usize)index].end
+
+    ## The scope name of span `index` (borrowed from the grammar; the caller copies it).
+    pub func span_scope(index: i32) -> str:
+        if index < 0 or (usize)index >= self.spans.used:
+            return ""
+        return self.grammar.text(self.spans.data[(usize)index].scope)
+
+    # -- teardown ------------------------------------------------------------------------------
+
+    pub mutating func close():
+        self.dispose()
+
+    mutating func dispose():
+        self.clear_stack()
+        self.all.free_all()
+        self.spans.free_all()
+        self.stack.free_all()
+        self.frame_pats.free_all()
+        self.visited.free_all()
+        self.owner.free_all()
+        self.c_start.free_all()
+        self.build.free_all()
+        self.grammar_ref.release()
+
+    static func own(native: Tokenizer*) -> interop.Reference[Tokenizer]!:
+        return try interop.Reference[Tokenizer].adopt(native, tokenizer_type)
+
+## The interop type of a `Tokenizer`.
+pub let tokenizer_type: interop.Type[Tokenizer] = interop.Type[Tokenizer]("TextMate tokenizer", Tokenizer.close, closeable = true)
+
+## Create a tokenizer for `grammar`. It keeps the grammar alive for its lifetime.
+pub func tokenizer(grammar: interop.Reference[Grammar]) -> interop.Reference[Tokenizer]!:
+    let native = try new Tokenizer(grammar)
+    return try Tokenizer.own(native)
+
+# mark: Free helpers ==========================================================================
+
+## Whether an `end` pattern refers back to a `begin` capture (`\1`..`\9` or `\k`), which means it
+## must be recompiled per region with those captures substituted in.
+func has_backref(src: str) -> bool:
+    let bytes = src.bytes
+    var i: usize = 0
+    while i < bytes.length:
+        if bytes[i] == (u8)'\\' and i + 1 < bytes.length:
+            let c = bytes[i + 1]
+            if (c >= (u8)'1' and c <= (u8)'9') or c == (u8)'k':
+                return true
+            i += 2
+        else:
+            i += 1
+    return false
+
+func bool_of(node: json.View?) -> bool:
+    let value = node else return false
+    return value.boolean() else false
+
+func same_scope(a: Str, b: Str) -> bool:
+    return a.off == b.off and a.len == b.len
+
+func is_meta(cp: u32) -> bool:
+    return cp == (u32)'\\' or cp == (u32)'.' or cp == (u32)'^' or cp == (u32)'$' or cp == (u32)'|' or cp == (u32)'?' or cp == (u32)'*' or cp == (u32)'+' or cp == (u32)'(' or cp == (u32)')' or cp == (u32)'[' or cp == (u32)']' or cp == (u32)'{' or cp == (u32)'}'
+
+func byte_slice(s: str, start: usize) -> str:
+    let bytes = s.bytes
+    if start >= bytes.length:
+        return ""
+    return (str)bytes[start..<bytes.length]
+
+func byte_slice2(s: str, start: usize, end: usize) -> str:
+    let bytes = s.bytes
+    if start >= end or end > bytes.length:
+        return ""
+    return (str)bytes[start..<end]
+
+func time_now() -> u64:
+    return time.now()
+
+func time_since(start: u64) -> i64:
+    return (i64)time.since(start)
+
+# mark: Tests =================================================================================
+
+func append_str(out: Vec[u8]*, s: str) -> !:
+    let bytes = s.bytes
+    var i: usize = 0
+    while i < bytes.length:
+        discard(try out.push(bytes[i]))
+        i += 1
+
+## Tokenize `line` under `source` and compare the rendered "start-end:scope;" list to `expected`.
+func check(source: str, line: str, expected: str) -> bool!:
+    var ok = false
+    with memory.heap:
+        let grammar = try load(source)
+        defer grammar.release()
+        let tok = try tokenizer(grammar)
+        defer tok.release()
+        let native = try tok.get()
+        let count = try native.tokenize(line)
+        var out = Vec[u8]()
+        defer out.free_all()
+        var i: i32 = 0
+        while i < count:
+            var buffer: u8[16]
+            try append_str(&out, try format(buffer, f"{native.span_start(i)}-{native.span_end(i)}:"))
+            try append_str(&out, native.span_scope(i))
+            try append_str(&out, ";")
+            i += 1
+        ok = (str)out.data[..<out.used] == expected
+    return ok
+
+test "grammar loads scope name and tokenizes a repository include":
+    assert(try check("{\"scopeName\":\"source.x\",\"patterns\":[{\"match\":\"a\",\"name\":\"k\"},{\"include\":\"#num\"}],\"repository\":{\"num\":{\"match\":\"[0-9]+\",\"name\":\"n\"}}}", "a 12", "0-1:k;2-4:n;"))
+
+test "tokenizer scopes keywords, numbers and comments":
+    assert(try check("{\"scopeName\":\"source.toy\",\"patterns\":[{\"match\":\"\\\\b(let|if|else)\\\\b\",\"name\":\"keyword.control.toy\"},{\"match\":\"#.*$\",\"name\":\"comment.line.toy\"},{\"match\":\"\\\\b[0-9]+\\\\b\",\"name\":\"constant.numeric.toy\"}]}", "let x = 42  # hi", "0-3:keyword.control.toy;8-10:constant.numeric.toy;12-16:comment.line.toy;"))
+
+test "tokenizer spans a begin/end string region":
+    assert(try check("{\"scopeName\":\"source.toy\",\"patterns\":[{\"begin\":\"\\\"\",\"end\":\"\\\"\",\"name\":\"string.quoted.double.toy\"}]}", "x \"ab\" y", "2-6:string.quoted.double.toy;"))
+
+test "tokenizer nests regions and $self includes":
+    assert(try check("{\"scopeName\":\"source.n\",\"patterns\":[{\"begin\":\"\\\\(\",\"end\":\"\\\\)\",\"name\":\"meta.paren\",\"patterns\":[{\"include\":\"$self\"},{\"match\":\"[0-9]+\",\"name\":\"num\"}]},{\"match\":\"[0-9]+\",\"name\":\"num\"}]}", "(1 (2))", "0-1:meta.paren;1-2:num;2-4:meta.paren;4-5:num;5-7:meta.paren;"))
+
+test "tokenizer carries region state across lines within a document":
+    # The open string on line 1 stays open and closes on line 2; codepoint offsets are absolute.
+    assert(try check("{\"scopeName\":\"source.toy\",\"patterns\":[{\"begin\":\"\\\"\",\"end\":\"\\\"\",\"name\":\"string.quoted.double.toy\"}]}", "x \"open\nstill\" y", "2-7:string.quoted.double.toy;8-14:string.quoted.double.toy;"))

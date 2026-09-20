@@ -4,8 +4,7 @@ source = "src"
 
 [dependencies]
 luce_regex = "../luce-regex"
+luce_json = "../luce-json"
 
 [exports]
-tm_json = "luce_textmate.json"
-tm_grammar = "luce_textmate.grammar"
-tm_tokenizer = "luce_textmate.tokenizer"
+tm = "luce_textmate.textmate"
