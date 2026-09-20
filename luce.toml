@@ -1,0 +1,6 @@
+[package]
+name = "luce_textmate"
+source = "src"
+
+[dependencies]
+luce_regex = "../luce-regex"
