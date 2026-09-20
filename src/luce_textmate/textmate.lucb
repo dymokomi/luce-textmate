@@ -589,9 +589,12 @@ pub struct Tokenizer:
         while n < self.line_count:
             discard(try self.line_span_start.push((i32)self.spans.used))
             let ls = (usize)self.new_line_start.data[(usize)n]
+            # Include the line's trailing newline in the subject, as Oniguruma/TextMate grammars
+            # expect: a line-comment `end` like `\n` or `(?=$)` only matches when the newline is there,
+            # otherwise the region never closes and bleeds into the rest of the file.
             var le: usize = self.all.used
             if n + 1 < self.line_count:
-                le = (usize)(self.new_line_start.data[(usize)(n + 1)] - 1)
+                le = (usize)self.new_line_start.data[(usize)(n + 1)]
             if (i32)(le - ls) <= MAX_LINE:
                 try self.tokenize_line(ls, le)
             let state = try self.capture_state()
@@ -1266,7 +1269,7 @@ test "tokenizer nests regions and $self includes":
 
 test "tokenizer carries region state across lines within a document":
     # The open string on line 1 stays open and closes on line 2; codepoint offsets are absolute.
-    assert(try check("{\"scopeName\":\"source.toy\",\"patterns\":[{\"begin\":\"\\\"\",\"end\":\"\\\"\",\"name\":\"string.quoted.double.toy\"}]}", "x \"open\nstill\" y", "2-7:string.quoted.double.toy;8-14:string.quoted.double.toy;"))
+    assert(try check("{\"scopeName\":\"source.toy\",\"patterns\":[{\"begin\":\"\\\"\",\"end\":\"\\\"\",\"name\":\"string.quoted.double.toy\"}]}", "x \"open\nstill\" y", "2-8:string.quoted.double.toy;8-14:string.quoted.double.toy;"))
 
 # -- incremental re-tokenization ---------------------------------------------------------------
 
