@@ -88,6 +88,16 @@ pub class Outcome:
 pub class Tokenizer:
     let grammar: Grammar
     let registry: map[str, Grammar]
+    ## Per-line match cache for the current top frame: each pattern's next match at or after the
+    ## scan position, so a pattern is re-searched only when its match is consumed. A match that
+    ## starts before the current position is stale (re-searched); -1 means no more matches this
+    ## line; -2 means not yet searched. `\G` patterns are never cached (their result is
+    ## anchor-dependent). Reset for each line and whenever the top frame changes.
+    var c_frame: Frame?
+    var c_start: list[int]
+    var c_match: list[Match?]
+    var c_end_start: int
+    var c_end_match: Match?
 
     ## `registry` maps a grammar's scopeName to the grammar, so `include`s of other languages
     ## ("source.css", "text.html.basic#…") resolve for embedded highlighting. Pass an empty map
@@ -95,6 +105,11 @@ pub class Tokenizer:
     func init(self, grammar: Grammar, registry: map[str, Grammar]):
         self.grammar = grammar
         self.registry = registry
+        self.c_frame = none
+        self.c_start = []
+        self.c_match = []
+        self.c_end_start = -2
+        self.c_end_match = none
 
     ## The state to start a document in: a single root region carrying the grammar's patterns.
     pub func start_state(self) -> State:
@@ -110,6 +125,7 @@ pub class Tokenizer:
         var stack: list[Frame] = []
         for f in incoming.frames:
             stack.append(f)
+        self.c_frame = none
         var owner: list[str] = []
         var z = 0
         while z < n:
@@ -153,45 +169,90 @@ pub class Tokenizer:
             i += 1
         return p
 
+    ## Refresh the match cache for `top` at `pos`: rebuild it when the frame changed, then make
+    ## sure every candidate's and the end's next match is known at or after `pos`. A cached match
+    ## that still starts at or after `pos` is reused; one consumed (start < pos), never searched,
+    ## or from a `\G` pattern is searched again. This makes a line's work linear in its length
+    ## rather than quadratic.
+    func refresh(self, top: Frame, subject: list[str], pos: int) -> unit:
+        var same = false
+        if let cf = self.c_frame:
+            if cf is top:
+                same = true
+        if not same:
+            self.c_frame = top
+            self.c_start = []
+            self.c_match = []
+            var k = 0
+            while k < top.patterns.length:
+                self.c_start.append(-2)
+                self.c_match.append(none)
+                k += 1
+            self.c_end_start = -2
+            self.c_end_match = none
+        if let e = top.end:
+            if self.c_end_start == -2 or (self.c_end_start >= 0 and self.c_end_start < pos) or e.uses_g():
+                if let m = e.search(subject, pos, pos):
+                    self.c_end_start = m.start()
+                    self.c_end_match = m
+                else:
+                    self.c_end_start = -1
+                    self.c_end_match = none
+        else:
+            self.c_end_start = -1
+            self.c_end_match = none
+        var i = 0
+        while i < top.patterns.length:
+            let rule = top.patterns[i].rule
+            let re = rule.matcher if rule.is_match() else rule.begin
+            if let r = re:
+                if self.c_start[i] == -2 or (self.c_start[i] >= 0 and self.c_start[i] < pos) or r.uses_g():
+                    if let m = r.search(subject, pos, pos):
+                        self.c_start[i] = m.start()
+                        self.c_match[i] = m
+                    else:
+                        self.c_start[i] = -1
+                        self.c_match[i] = none
+            else:
+                self.c_start[i] = -1
+                self.c_match[i] = none
+            i += 1
+
     ## Take one step from `pos`: colour up to the leftmost match, then apply it (a match rule, a
     ## region begin, or the current region's end). Returns the new position, or -1 when nothing
     ## on the rest of the line matches.
     func step(self, stack: list[Frame], subject: list[str], owner: list[str], pos: int, n: int) -> int:
         let top = stack[stack.length - 1]
+        self.refresh(top, subject, pos)
         var best_start = n + 1
         var best_end = 0
         var best_match: Match? = none
         var best_candidate: Candidate? = none
         var best_is_end = false
-        if not top.apply_end_last:
-            if let e = top.end:
-                if let m = e.search(subject, pos, pos):
-                    if m.start() < best_start:
-                        best_start = m.start()
-                        best_end = m.finish()
-                        best_match = m
-                        best_is_end = true
-                        best_candidate = none
-        for candidate in top.patterns:
-            let rule = candidate.rule
-            let re = rule.matcher if rule.is_match() else rule.begin
-            let r = re else continue
-            if let m = r.search(subject, pos, pos):
-                if m.start() < best_start:
-                    best_start = m.start()
+        if not top.apply_end_last and self.c_end_start >= 0 and self.c_end_start < best_start:
+            if let m = self.c_end_match:
+                best_start = self.c_end_start
+                best_end = m.finish()
+                best_match = m
+                best_is_end = true
+                best_candidate = none
+        var i = 0
+        while i < top.patterns.length:
+            if self.c_start[i] >= 0 and self.c_start[i] < best_start:
+                if let m = self.c_match[i]:
+                    best_start = self.c_start[i]
                     best_end = m.finish()
                     best_match = m
                     best_is_end = false
-                    best_candidate = candidate
-        if top.apply_end_last:
-            if let e = top.end:
-                if let m = e.search(subject, pos, pos):
-                    if m.start() < best_start:
-                        best_start = m.start()
-                        best_end = m.finish()
-                        best_match = m
-                        best_is_end = true
-                        best_candidate = none
+                    best_candidate = top.patterns[i]
+            i += 1
+        if top.apply_end_last and self.c_end_start >= 0 and self.c_end_start < best_start:
+            if let m = self.c_end_match:
+                best_start = self.c_end_start
+                best_end = m.finish()
+                best_match = m
+                best_is_end = true
+                best_candidate = none
         let m = best_match else return -1
         self.fill(owner, pos, best_start, self.deepest(stack))
         if best_is_end:
