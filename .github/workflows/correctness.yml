@@ -1,0 +1,44 @@
+name: Correctness
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: luce-textmate
+      - id: pins
+        run: |
+          echo "base=$(cat luce-textmate/bootstrap/BASE)" >> "$GITHUB_OUTPUT"
+          echo "regex=$(cat luce-textmate/bootstrap/REGEX)" >> "$GITHUB_OUTPUT"
+          echo "json=$(cat luce-textmate/bootstrap/JSON)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7
+        with:
+          repository: dymokomi/luce-base
+          ref: ${{ steps.pins.outputs.base }}
+          path: luce-base
+      - uses: actions/checkout@v7
+        with:
+          repository: dymokomi/luce-regex
+          ref: ${{ steps.pins.outputs.regex }}
+          path: luce-regex
+      - uses: actions/checkout@v7
+        with:
+          repository: dymokomi/luce-json
+          ref: ${{ steps.pins.outputs.json }}
+          path: luce-json
+      - name: Select Clang
+        run: |
+          mkdir -p "$RUNNER_TEMP/luce-bin"
+          ln -s "$(command -v clang)" "$RUNNER_TEMP/luce-bin/cc"
+          echo "$RUNNER_TEMP/luce-bin" >> "$GITHUB_PATH"
+      - run: cd luce-base && ./build.sh
+      - run: ./test.sh
+        working-directory: luce-textmate
