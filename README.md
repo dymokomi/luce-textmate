@@ -1,7 +1,7 @@
 # luce-textmate
 
 Loads TextMate grammars (`.tmLanguage.json`) and tokenizes source a line at a time into scoped
-spans, so an editor can colour any language by dropping in its grammar file. It matches with
+spans, so an editor can color any language by dropping in its grammar file. It matches with
 luce-regex and depends only on that plus the standard library.
 
 The package parses grammar JSON with its own small reader that builds Luce values (objects,

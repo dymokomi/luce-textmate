@@ -5,7 +5,7 @@
 #   DESCRIPTION:
 #       Loads a `.tmLanguage.json` grammar (parsed with luce-json) into a compact model — an arena
 #       of interned strings plus index-linked pools of rules, pattern references and captures —
-#       and tokenizes a whole document line by line, returning scoped spans an editor colours
+#       and tokenizes a whole document line by line, returning scoped spans an editor colors
 #       through its theme. Each pattern is compiled to a luce-regex `Regex`; a pattern the engine
 #       cannot parse becomes inert rather than failing the grammar. Grammar and Tokenizer are
 #       exposed to Luce through interop; everything the tokenizer touches per line is plain Base
@@ -37,7 +37,7 @@ let R_GROUP: u8 = 2
 # A visited marker standing for "$self"/"$base" (not a valid rule index).
 let TOP_MARK: i32 = -7
 
-## Very long lines are left uncoloured: matching every pattern across them costs more than the
+## Very long lines are left uncolored: matching every pattern across them costs more than the
 ## result is worth, and a minified blob rarely wants highlighting anyway.
 let MAX_LINE: i32 = 20000
 
@@ -391,7 +391,7 @@ pub func load(source: str) -> interop.Reference[Grammar]!:
 
 # mark: The tokenizer =========================================================================
 
-## One coloured run of the document: codepoints [start, end) carry the innermost `scope`.
+## One colored run of the document: codepoints [start, end) carry the innermost `scope`.
 struct OutSpan:
     var start: i32 = 0
     var end: i32 = 0
@@ -503,7 +503,7 @@ pub struct Tokenizer:
         self.prev_char_count = 0
 
     ## Tokenize the whole document `text`. Returns the number of spans, readable with the span
-    ## accessors. Colours from the top of the file down; a very large file's tail may be left
+    ## accessors. Colors from the top of the file down; a very large file's tail may be left
     ## plain when the time budget is spent.
     pub mutating func tokenize(text: str) -> i64!:
         self.all.used = 0
@@ -569,7 +569,7 @@ pub struct Tokenizer:
         self.clear_stack()
         return (i64)self.spans.used
 
-    ## A full tokenize over the already-decoded document. Colours top to bottom; a very large file's
+    ## A full tokenize over the already-decoded document. Colors top to bottom; a very large file's
     ## tail may be left plain when the time budget is spent (then no incremental reuse is offered).
     mutating func full_tokenize() -> i64!:
         self.override_arena.used = 0
@@ -853,7 +853,7 @@ pub struct Tokenizer:
                 self.c_start.data[(usize)i] = -1
             i += 1
 
-    ## Take one step from `pos`: colour up to the leftmost match, then apply it (a match rule, a
+    ## Take one step from `pos`: color up to the leftmost match, then apply it (a match rule, a
     ## region begin, or the current region's end). Returns the new position, or -1 when nothing on
     ## the rest of the line matches.
     mutating func step(subject: const u32[], pos: i32, n: i32) -> i32!:
@@ -1010,7 +1010,7 @@ pub struct Tokenizer:
             i += 1
         return false
 
-    # -- colouring -----------------------------------------------------------------------------
+    # -- coloring -----------------------------------------------------------------------------
 
     ## The innermost scope in force (a frame's contentName, else its name).
     func deepest() -> Str:

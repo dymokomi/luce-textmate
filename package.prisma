@@ -4,7 +4,7 @@ def package "luce-textmate" {
     str version = "0.2.3"
     str kind = "package"
     str language = "luce-base"
-    str description = "Loads TextMate grammars (.tmLanguage.json) and tokenizes source a line at a time into scoped spans, so an editor can colour any language by dropping in its grammar file. It matches with luce-regex and depends only on that plus the standard library."
+    str description = "Loads TextMate grammars (.tmLanguage.json) and tokenizes source a line at a time into scoped spans, so an editor can color any language by dropping in its grammar file. It matches with luce-regex and depends only on that plus the standard library."
     str readme = "README.md"
 
     def export "tm" {
