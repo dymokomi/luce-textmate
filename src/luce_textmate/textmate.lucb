@@ -984,6 +984,8 @@ pub struct Tokenizer:
             pr = ref.next
 
     mutating func expand_include(key: str) -> !:
+        # "$self", "$base" and "#name" resolve here; "source.x" and "source.x#name"
+        # (cross-grammar embedding) are not resolved in this version and add nothing.
         if key == "$self" or key == "$base":
             if not self.seen(TOP_MARK):
                 discard(try self.visited.push(TOP_MARK))
@@ -1000,7 +1002,6 @@ pub struct Tokenizer:
                 else:
                     discard(try self.frame_pats.push(rule_index))
             return
-        # "source.x" / "source.x#name": cross-grammar embedding is not resolved in this version.
 
     func seen(mark: i32) -> bool:
         var i: usize = 0
@@ -1376,14 +1377,14 @@ func two_edits_match(source: str, initial: str, s1: i64, e1: i64, r1: str, s2: i
 
 test "incremental edit matches a full re-tokenize across edit shapes":
     let initial = "let x = \"abc\"\nlet y = 5\n# c\nlet z = 9"
-    assert(try edits_match(toy(), initial, 2, 2, "Q"))          # insert on line 0
-    assert(try edits_match(toy(), initial, 16, 16, "abc"))      # insert on a middle line
-    assert(try edits_match(toy(), initial, 24, 25, ""))         # delete the '#' (line stops being a comment)
-    assert(try edits_match(toy(), initial, 16, 16, "\n"))       # insert a newline (line count +1)
-    assert(try edits_match(toy(), initial, 13, 23, ""))         # delete a whole line (line count -1)
-    assert(try edits_match(toy(), initial, 16, 16, "\""))       # open a string that runs to EOF
-    assert(try edits_match(toy(), initial, 36, 36, "0"))        # edit the last line
-    assert(try edits_match(toy(), initial, 0, 3, "if"))         # replace the first token
+    assert(try edits_match(toy(), initial, 2, 2, "Q"))  # insert on line 0
+    assert(try edits_match(toy(), initial, 16, 16, "abc"))  # insert on a middle line
+    assert(try edits_match(toy(), initial, 24, 25, ""))  # delete the '#' (line stops being a comment)
+    assert(try edits_match(toy(), initial, 16, 16, "\n"))  # insert a newline (line count +1)
+    assert(try edits_match(toy(), initial, 13, 23, ""))  # delete a whole line (line count -1)
+    assert(try edits_match(toy(), initial, 16, 16, "\""))  # open a string that runs to EOF
+    assert(try edits_match(toy(), initial, 36, 36, "0"))  # edit the last line
+    assert(try edits_match(toy(), initial, 0, 3, "if"))  # replace the first token
 
 test "chained incremental edits match a full re-tokenize":
     let initial = "let a = 1\nlet b = 2\nlet c = 3\nlet d = 4"
