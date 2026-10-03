@@ -18,13 +18,13 @@
 #==============================================================================================
 
 import memory
-import utf8
+import luce_std.utf8
 import interop
 import ownership
 import strings
 import time
-import regex
-import json
+import luce_regex.regex
+import luce_json.json
 
 ## A grammar whose JSON did not describe a usable rule set.
 pub let grammar_error: ErrorCode = ErrorCode.package(332)
