@@ -306,14 +306,14 @@ pub struct Grammar:
             i += 1
         return head
 
-    func first(node: json.View, a: str, b: str) -> json.View?:
+    static func first(node: json.View, a: str, b: str) -> json.View?:
         if let value = node.member(a):
             return value
         return node.member(b)
 
     ## Compile a pattern, or none when empty or unparseable, so one exotic pattern does not sink
     ## the whole grammar.
-    func compile_safe(pattern: str) -> regex.Regex*?:
+    static func compile_safe(pattern: str) -> regex.Regex*?:
         if pattern == "":
             return none
         let compiled = new regex.Regex(pattern, false) catch failure:
@@ -378,7 +378,7 @@ pub struct Grammar:
         self.file_types.free_all()
         self.repo.free_all()
 
-    func own(native: Grammar*) -> interop.Reference[Grammar]!:
+    static func own(native: Grammar*) -> interop.Reference[Grammar]!:
         return try interop.Reference[Grammar].adopt(native, grammar_type)
 
 ## The interop type of a loaded `Grammar`.
@@ -1178,7 +1178,7 @@ pub struct Tokenizer:
     func trace(visit: func(ownership.Object*, void*) -> unit, context: void*):
         self.grammar_ref.trace(visit, context)
 
-    func own(native: Tokenizer*) -> interop.Reference[Tokenizer]!:
+    static func own(native: Tokenizer*) -> interop.Reference[Tokenizer]!:
         return try interop.Reference[Tokenizer].adopt(native, tokenizer_type)
 
 ## The interop type of a `Tokenizer`.
