@@ -10,19 +10,16 @@ def package "luce-textmate" {
 
     def dependency "luce-regex" {
         str owner = "dymokomi"
-        str version = "^0.6.0"
         str path = "../luce-regex"
     }
 
     def dependency "luce-json" {
         str owner = "dymokomi"
-        str version = "^0.6.0"
         str path = "../luce-json"
     }
 
     def dependency "luce-std" {
         str owner = "dymokomi"
-        str version = "^0.6.0"
         str path = "../luce-std"
     }
 }
